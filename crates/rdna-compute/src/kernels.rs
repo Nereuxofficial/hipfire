@@ -94,6 +94,8 @@ __device__ __forceinline__ float half_to_float(unsigned short h) {
 
 // Q4_K GEMV v6: 32 threads (single warp), 8 elements per thread per Q4K block.
 // No shared memory needed — warp shuffle only. Higher occupancy.
+// launch_bounds: 32 threads, target 20 blocks/CU (10 waves/SIMD) for max occupancy.
+__launch_bounds__(32, 20)
 extern "C" __global__ void gemv_q4k(
     const unsigned char* __restrict__ A_q4k,
     const float* __restrict__ x,
