@@ -20,11 +20,28 @@
 - No existing Rust GGUF crate has ROCm/HIP support — we are first
 - candle-rs has production GGUF loader but no HIP backend
 
+## ncdrone/rustane (Reference Project)
+
+**CORRECTION**: Research agent falsely reported this repo didn't exist (got a 404/rate limit,
+concluded it was hallucinated). The repo IS real: 21 commits, MIT license, by Daniel Isaac.
+
+rustane is Rust training + inference for Apple Neural Engine. Architecture:
+- **ane-bridge** — Safe Rust FFI to ANE private APIs via objc2/dlopen. MIL kernel gen, IOSurface I/O.
+- **metal-decode** — Metal compute shaders for single-token decode (planned).
+- **engine** — Training orchestrator: ANE forward (10 fused kernels), CPU backward, Metal Adam.
+
+Training validated to 5B params, forward to 30B on M4 Max 128GB. Key findings:
+- Architecture crossover at 3B: wide+shallow wins below, deep+narrow wins above
+- dim must be divisible by 128, hidden divisible by 16 (ANE alignment constraints)
+- Per-ANE-dispatch overhead: ~0.095ms (XPC + IOKit round-trip)
+
+Our rx-rustane independently converged on the same 3-crate pattern:
+  ane-bridge → hip-bridge | metal-decode → rdna-compute | engine → engine
+
 ## Rust HIP Ecosystem
 
-- ncdrone/rustane does NOT exist publicly (the CLAUDE.md reference was hallucinated)
 - Real crates: cubecl-hip-sys (tracel-ai, actively maintained), hip-rs (smedegaard)
-- Our hip-bridge independently follows the same dlopen + RAII + safe wrapper pattern
+- Our hip-bridge follows the same dlopen + RAII + safe wrapper pattern as ane-bridge
 - cudarc (CUDA) is the gold standard for the 3-tier FFI pattern
 
 ## Qwen3 vs Qwen3.5
