@@ -92,7 +92,8 @@ __device__ __forceinline__ float half_to_float(unsigned short h) {
     return __int_as_float((sign << 31) | ((exp + 127 - 15) << 23) | (frac << 13));
 }
 
-// Q4_K GEMV v4: 256 threads, native half, register-only scale decode, no sync in hot loop.
+// Q4_K GEMV v5: 256 threads, native half, warp shuffle reduction.
+// Key optimization: __shfl_down for intra-warp reduction eliminates most __syncthreads.
 extern "C" __global__ void gemv_q4k(
     const unsigned char* __restrict__ A_q4k,
     const float* __restrict__ x,
@@ -103,13 +104,13 @@ extern "C" __global__ void gemv_q4k(
 
     const int row = blockIdx.x;
     if (row >= M) return;
-    const int tid = threadIdx.x;
+    const int tid = threadIdx.x; // 0..255
 
     const int blocks_per_row = K / 256;
     const unsigned char* row_data = A_q4k + (size_t)row * blocks_per_row * 144;
 
-    const int group = tid >> 6;             // tid / 64
-    const int sub_in_group = (tid >> 5) & 1; // 0 or 1
+    const int group = tid >> 6;
+    const int sub_in_group = (tid >> 5) & 1;
     const int sb = (group << 1) | sub_in_group;
     const int lane = tid & 31;
 
@@ -118,12 +119,11 @@ extern "C" __global__ void gemv_q4k(
     for (int bi = 0; bi < blocks_per_row; bi++) {
         const unsigned char* block = row_data + bi * 144;
 
-        // Use __builtin_amdgcn_readfirstlane for broadcast (all threads read same addr, L1 handles it)
-        const _Float16* hdr = (const _Float16*)block;
-        float d = (float)hdr[0];
-        float dmin = (float)hdr[1];
+        // Native half load
+        float d = (float)*((const _Float16*)block);
+        float dmin = (float)*((const _Float16*)(block + 2));
 
-        // Decode scale/min for this thread's sub-block (register only, no shared mem)
+        // Scale decode (branches uniform per wavefront — no divergence)
         const unsigned char* sc = block + 4;
         float fscale, fmin;
         if (sb < 4) {
@@ -135,19 +135,32 @@ extern "C" __global__ void gemv_q4k(
             fmin = dmin * (float)((sc[8+i] >> 4) | ((sc[4+i] >> 6) << 4));
         }
 
+        // Coalesced byte load within each group's wavefront
         unsigned char qbyte = block[16 + (group << 5) + lane];
         float w = fscale * (float)(sub_in_group == 0 ? (qbyte & 0xF) : (qbyte >> 4)) - fmin;
         sum += w * x[bi * 256 + tid];
     }
 
-    sdata[tid] = sum;
-    __syncthreads();
-    for (int s = 128; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
-        __syncthreads();
+    // Warp shuffle reduction (no shared memory sync needed within wavefront)
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down(sum, offset);
     }
-    if (tid == 0) {
-        y[row] = sdata[0];
+
+    // Lane 0 of each wavefront writes to shared memory
+    if (lane == 0) {
+        sdata[tid >> 5] = sum;  // 8 values for 256/32 wavefronts
+    }
+    __syncthreads();
+
+    // Final reduction by first 8 threads
+    if (tid < 8) {
+        sum = sdata[tid];
+        for (int offset = 4; offset > 0; offset >>= 1) {
+            sum += __shfl_down(sum, offset);
+        }
+        if (tid == 0) {
+            y[row] = sum;
+        }
     }
 }
 "#;
