@@ -667,6 +667,39 @@ impl Gpu {
         }
     }
 
+    /// GPU-side argmax: returns index of max value. Avoids downloading full logits.
+    pub fn argmax_f32(&mut self, data: &GpuTensor, n: usize) -> HipResult<u32> {
+        self.ensure_kernel("argmax_f32", kernels::ARGMAX_SRC, "argmax_f32")?;
+        let func = &self.functions["argmax_f32"];
+
+        let result_buf = self.hip.malloc(4)?; // single int
+        self.hip.memset(&result_buf, 0, 4)?;
+
+        let mut dp = data.buf.as_ptr();
+        let mut rp = result_buf.as_ptr();
+        let mut nn = n as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dp as *mut _ as *mut c_void,
+            &mut rp as *mut _ as *mut c_void,
+            &mut nn as *mut _ as *mut c_void,
+        ];
+
+        let block_size = 256u32;
+        let shared = block_size * 8; // float + int per thread
+        unsafe {
+            self.hip.launch_kernel(func, [1, 1, 1], [block_size, 1, 1], shared, None, &mut params)?;
+        }
+
+        let mut result = [0i32];
+        let result_bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(result.as_mut_ptr() as *mut u8, 4)
+        };
+        self.hip.memcpy_dtoh(result_bytes, &result_buf)?;
+        self.hip.free(result_buf)?;
+        Ok(result[0] as u32)
+    }
+
     /// out = rmsnorm(x, weight, eps)
     pub fn rmsnorm_f32(
         &mut self,
