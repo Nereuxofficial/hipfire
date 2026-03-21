@@ -4,6 +4,7 @@ members = [
     "crates/hip-bridge",
     "crates/rdna-compute",
     "crates/engine",
+    "crates/hipfire-quantize",
 ]
 
 [workspace.package]

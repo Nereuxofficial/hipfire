@@ -155,7 +155,7 @@ pub fn dequantize_q8_0(data: &[u8], n: usize) -> Vec<f32> {
     out
 }
 
-fn f16_to_f32(bits: u16) -> f32 {
+pub fn f16_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) & 1) as u32;
     let exp = ((bits >> 10) & 0x1F) as u32;
     let frac = (bits & 0x3FF) as u32;
@@ -181,6 +181,34 @@ fn f16_to_f32(bits: u16) -> f32 {
     }
     let exp32 = exp + 127 - 15;
     f32::from_bits((sign << 31) | (exp32 << 23) | (frac << 13))
+}
+
+pub fn f32_to_f16(val: f32) -> u16 {
+    let bits = val.to_bits();
+    let sign = (bits >> 31) & 1;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let frac = bits & 0x7FFFFF;
+
+    if exp == 0xFF {
+        let f16_frac = if frac == 0 { 0 } else { (frac >> 13) | 1 };
+        return ((sign << 15) | (0x1F << 10) | f16_frac) as u16;
+    }
+
+    let new_exp = exp - 127 + 15;
+
+    if new_exp >= 31 {
+        return ((sign << 15) | (0x1F << 10)) as u16; // overflow → inf
+    }
+    if new_exp <= 0 {
+        if new_exp < -10 {
+            return (sign << 15) as u16; // underflow → zero
+        }
+        let f = frac | 0x800000;
+        let shift = (1 - new_exp + 13) as u32;
+        return ((sign << 15) | (f >> shift)) as u16;
+    }
+
+    ((sign << 15) | ((new_exp as u32) << 10) | (frac >> 13)) as u16
 }
 
 /// Dequantize Q4_K data to f32.
@@ -246,6 +274,129 @@ pub fn dequantize_q4_k(data: &[u8], n: usize) -> Vec<f32> {
         }
     }
     out
+}
+
+/// Convert Q4_K raw data to Q4_F16_G64 format.
+/// Dequantizes Q4_K to F32 intermediates, then re-quantizes to Q4_F16_G64.
+/// Q4_K: 144 bytes per 256 elements → Q4_F16_G64: 4×36=144 bytes per 256 elements (same size).
+pub fn convert_q4k_to_q4f16_g64(q4k_data: &[u8], n_elements: usize) -> Vec<u8> {
+    let f32_values = dequantize_q4_k(q4k_data, n_elements);
+
+    let group_size = 64;
+    let block_bytes = 36;
+    let n_blocks = (n_elements + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n_elements);
+        let group = &f32_values[start..end];
+
+        let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+        let range = max_val - min_val;
+        let scale = if range > 0.0 { range / 15.0 } else { 1.0 };
+        let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
+
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 2].copy_from_slice(&f32_to_f16(scale).to_le_bytes());
+        output[out_off + 2..out_off + 4].copy_from_slice(&f32_to_f16(min_val).to_le_bytes());
+
+        // Pack nibbles: byte[i] = low_nibble(element i) | high_nibble(element i+32)
+        let actual_len = end - start;
+        for i in 0..32 {
+            let lo_val = if i < actual_len { group[i] } else { min_val };
+            let hi_val = if 32 + i < actual_len { group[32 + i] } else { min_val };
+
+            let lo_q = ((lo_val - min_val) * inv_scale + 0.5) as u8;
+            let hi_q = ((hi_val - min_val) * inv_scale + 0.5) as u8;
+
+            output[out_off + 4 + i] = lo_q.min(15) | (hi_q.min(15) << 4);
+        }
+    }
+
+    output
+}
+
+/// Convert Q4_K raw data to Q4_F16_G32 format — nearly lossless.
+/// Each Q4_K sub-block (32 elements) maps directly to one Q4_F16_G32 block.
+/// Nibbles are preserved exactly; only scale/min are converted to FP16.
+/// Q4_K: 144 bytes per 256 elements → Q4_F16_G32: 8×20=160 bytes per 256 elements (11% larger).
+pub fn convert_q4k_to_q4f16_g32(q4k_data: &[u8], n_elements: usize) -> Vec<u8> {
+    let q4k_block_bytes = 144;
+    let q4k_block_elems = 256;
+    let g32_block_bytes = 20;
+    let nblocks = (n_elements + q4k_block_elems - 1) / q4k_block_elems;
+    // 8 sub-blocks per Q4_K super-block → 8 G32 blocks
+    let mut output = vec![0u8; nblocks * 8 * g32_block_bytes];
+
+    for b in 0..nblocks {
+        let off = b * q4k_block_bytes;
+        if off + q4k_block_bytes > q4k_data.len() {
+            break;
+        }
+
+        let d = f16_to_f32(u16::from_le_bytes([q4k_data[off], q4k_data[off + 1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([q4k_data[off + 2], q4k_data[off + 3]]));
+
+        let sc_data = &q4k_data[off + 4..off + 16];
+        let mut scales = [0u8; 8];
+        let mut mins = [0u8; 8];
+
+        for i in 0..4 {
+            scales[i] = sc_data[i] & 63;
+            mins[i] = sc_data[4 + i] & 63;
+        }
+        for i in 0..4 {
+            scales[4 + i] = (sc_data[8 + i] & 0xF) | ((sc_data[i] >> 6) << 4);
+            mins[4 + i] = (sc_data[8 + i] >> 4) | ((sc_data[4 + i] >> 6) << 4);
+        }
+
+        let qdata = &q4k_data[off + 16..off + 16 + 128];
+
+        // Each of 4 groups has 2 sub-blocks (even=lower nibble, odd=upper nibble)
+        for group in 0..4 {
+            let sb_even = group * 2;
+            let sb_odd = group * 2 + 1;
+
+            // Sub-block even (elements group*64+0..group*64+31) → G32 block
+            let eff_scale_even = d * scales[sb_even] as f32;
+            let eff_min_even = -(dmin * mins[sb_even] as f32);
+            let out_off_even = (b * 8 + sb_even) * g32_block_bytes;
+            output[out_off_even..out_off_even + 2].copy_from_slice(&f32_to_f16(eff_scale_even).to_le_bytes());
+            output[out_off_even + 2..out_off_even + 4].copy_from_slice(&f32_to_f16(eff_min_even).to_le_bytes());
+
+            // Sub-block odd (elements group*64+32..group*64+63) → G32 block
+            let eff_scale_odd = d * scales[sb_odd] as f32;
+            let eff_min_odd = -(dmin * mins[sb_odd] as f32);
+            let out_off_odd = (b * 8 + sb_odd) * g32_block_bytes;
+            output[out_off_odd..out_off_odd + 2].copy_from_slice(&f32_to_f16(eff_scale_odd).to_le_bytes());
+            output[out_off_odd + 2..out_off_odd + 4].copy_from_slice(&f32_to_f16(eff_min_odd).to_le_bytes());
+
+            // Copy nibbles: Q4_K stores them as byte[l] where low=even, high=odd.
+            // G32 packing: byte[i] = lo_nibble(elem i) | hi_nibble(elem i+16)
+            // Q4_K byte[l] has: elem l in low nibble, elem l+32 in high nibble.
+            // For sub-block even: we want the 32 lower nibbles from group*32 bytes.
+            // For sub-block odd: we want the 32 upper nibbles.
+            // G32 block maps: thread t reads byte[t&15], lo nibble = elem t (t<16), hi nibble = elem t-16+16=t (t>=16)
+            // So G32 byte[i] = nibble(elem i) | nibble(elem i+16) << 4
+            for i in 0..16 {
+                let src_byte_0 = qdata[group * 32 + i];
+                let src_byte_1 = qdata[group * 32 + 16 + i];
+                // Even sub-block: lower nibbles
+                let nib_0 = src_byte_0 & 0xF;
+                let nib_1 = src_byte_1 & 0xF;
+                output[out_off_even + 4 + i] = nib_0 | (nib_1 << 4);
+                // Odd sub-block: upper nibbles
+                let nib_2 = src_byte_0 >> 4;
+                let nib_3 = src_byte_1 >> 4;
+                output[out_off_odd + 4 + i] = nib_2 | (nib_3 << 4);
+            }
+        }
+    }
+
+    output
 }
 
 /// Dequantize Q6_K data to f32 (matches GGML reference exactly).
@@ -333,9 +484,9 @@ fn load_tensor_f32(gguf: &GgufFile, info: &TensorInfo) -> Vec<f32> {
 /// A weight matrix on GPU — may be quantized or F32.
 pub struct WeightTensor {
     pub buf: GpuTensor,
-    pub dtype: GgmlType,
-    pub m: usize, // output dim (rows)
-    pub k: usize, // input dim (cols)
+    pub gpu_dtype: DType, // dispatch type for kernel selection
+    pub m: usize,         // output dim (rows)
+    pub k: usize,         // input dim (cols)
 }
 
 /// GPU-resident LLaMA model weights.
@@ -368,15 +519,16 @@ pub fn weight_gemv(
     x: &GpuTensor,
     y: &GpuTensor,
 ) -> HipResult<()> {
-    match w.dtype {
-        GgmlType::F32 => gpu.gemv_f32(&w.buf, x, y),
-        GgmlType::Q4K => gpu.gemv_q4k(&w.buf, x, y, w.m, w.k),
-        GgmlType::Q6K => gpu.gemv_q6k(&w.buf, x, y, w.m, w.k),
-        GgmlType::Q8_0 => gpu.gemv_q8_0(&w.buf, x, y, w.m, w.k),
+    match w.gpu_dtype {
+        DType::F32 => gpu.gemv_f32(&w.buf, x, y),
+        DType::Q4K => gpu.gemv_q4k(&w.buf, x, y, w.m, w.k),
+        DType::Q6K => gpu.gemv_q6k(&w.buf, x, y, w.m, w.k),
+        DType::Q8_0 => gpu.gemv_q8_0(&w.buf, x, y, w.m, w.k),
+        DType::Q4F16G64 => gpu.gemv_q4f16_g64(&w.buf, x, y, w.m, w.k),
+        DType::Q4F16G32 => gpu.gemv_q4f16_g32(&w.buf, x, y, w.m, w.k),
         other => {
-            // Fallback: dequantize to F32 on CPU, upload, GEMV
-            eprintln!("WARNING: no GPU kernel for {:?}, falling back to CPU dequant", other);
-            Err(hip_bridge::HipError::new(0, &format!("unsupported quant type {:?}", other)))
+            eprintln!("WARNING: no GPU kernel for {:?}", other);
+            Err(hip_bridge::HipError::new(0, &format!("unsupported dtype {:?}", other)))
         }
     }
 }
@@ -395,12 +547,38 @@ pub fn load_weights(
         let data = load_tensor_f32(gguf, info);
         gpu.upload_f32(&data, shape)
     }
-    // Helper: upload quantized weight
+    // Helper: upload quantized weight (converts Q4_K to Q4_F16_G64 at load time)
     fn up_weight(gguf: &GgufFile, gpu: &Gpu, name: &str, m: usize, k: usize) -> HipResult<WeightTensor> {
         let info = gguf.find_tensor(name).unwrap_or_else(|| panic!("tensor not found: {name}"));
         let raw_data = gguf.tensor_data(info);
-        let buf = gpu.upload_raw(raw_data, &[raw_data.len()])?;
-        Ok(WeightTensor { buf, dtype: info.dtype, m, k })
+
+        match info.dtype {
+            GgmlType::Q4K => {
+                let buf = gpu.upload_raw(raw_data, &[raw_data.len()])?;
+                Ok(WeightTensor { buf, gpu_dtype: DType::Q4K, m, k })
+            }
+            GgmlType::Q6K => {
+                let buf = gpu.upload_raw(raw_data, &[raw_data.len()])?;
+                Ok(WeightTensor { buf, gpu_dtype: DType::Q6K, m, k })
+            }
+            GgmlType::Q8_0 => {
+                let buf = gpu.upload_raw(raw_data, &[raw_data.len()])?;
+                Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k })
+            }
+            GgmlType::F32 => {
+                let buf = gpu.upload_raw(raw_data, &[raw_data.len()])?;
+                Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k })
+            }
+            _ => {
+                // Unsupported: dequant to F32 on CPU, upload as raw bytes
+                let data = load_tensor_f32(gguf, info);
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
+                };
+                let buf = gpu.upload_raw(bytes, &[bytes.len()])?;
+                Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k })
+            }
+        }
     }
 
     eprintln!("  loading token_embd...");
@@ -415,7 +593,7 @@ pub fn load_weights(
         let info = gguf.find_tensor("token_embd.weight").unwrap();
         let data = load_tensor_f32(gguf, info);
         let buf = gpu.upload_f32(&data, &[config.vocab_size, config.dim])?;
-        WeightTensor { buf, dtype: GgmlType::F32, m: config.vocab_size, k: config.dim }
+        WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim }
     };
 
     let mut layers = Vec::with_capacity(config.n_layers);
@@ -493,9 +671,22 @@ pub fn forward(
         let k = gpu.alloc_tensor(&[kv_dim], DType::F32)?;
         let v = gpu.alloc_tensor(&[kv_dim], DType::F32)?;
 
-        weight_gemv(gpu, &layer.wq, &tmp, &q)?;
-        weight_gemv(gpu, &layer.wk, &tmp, &k)?;
-        weight_gemv(gpu, &layer.wv, &tmp, &v)?;
+        // Fused QKV: 3 GEMVs in 1 kernel launch (saves 2 launches per layer)
+        if layer.wq.gpu_dtype == DType::Q4K
+            && layer.wk.gpu_dtype == DType::Q4K
+            && layer.wv.gpu_dtype == DType::Q4K
+        {
+            gpu.fused_qkv_q4k(
+                &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                &tmp,
+                &q, &k, &v,
+                layer.wq.m, layer.wk.m, layer.wv.m, layer.wq.k,
+            )?;
+        } else {
+            weight_gemv(gpu, &layer.wq, &tmp, &q)?;
+            weight_gemv(gpu, &layer.wk, &tmp, &k)?;
+            weight_gemv(gpu, &layer.wv, &tmp, &v)?;
+        }
 
         // QK normalization (Qwen3: still CPU-side for now)
         if config.has_qk_norm {
@@ -566,8 +757,18 @@ pub fn forward(
 
         let gate = gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?;
         let up = gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?;
-        weight_gemv(gpu, &layer.w_gate, &tmp, &gate)?;
-        weight_gemv(gpu, &layer.w_up, &tmp, &up)?;
+        // Fused Gate+Up: 2 GEMVs in 1 kernel launch
+        if layer.w_gate.gpu_dtype == DType::Q4K && layer.w_up.gpu_dtype == DType::Q4K {
+            gpu.fused_gate_up_q4k(
+                &layer.w_gate.buf, &layer.w_up.buf,
+                &tmp,
+                &gate, &up,
+                layer.w_gate.m, layer.w_up.m, layer.w_gate.k,
+            )?;
+        } else {
+            weight_gemv(gpu, &layer.w_gate, &tmp, &gate)?;
+            weight_gemv(gpu, &layer.w_up, &tmp, &up)?;
+        }
 
         // Fused SiLU(gate) * up — saves one kernel launch + intermediate buffer
         let ffn_hidden = gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?;

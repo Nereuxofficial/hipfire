@@ -30,8 +30,10 @@ pub enum DType {
     F16,
     Q4K,  // 144 bytes per 256 elements
     Q6K,  // 210 bytes per 256 elements
-    Q8_0, // 34 bytes per 32 elements
-    Raw,  // raw bytes, no element interpretation
+    Q8_0,      // 34 bytes per 32 elements
+    Q4F16G64,  // 36 bytes per 64 elements (RDNA-native FP16 dequant)
+    Q4F16G32,  // 20 bytes per 32 elements (RDNA-native FP16 dequant)
+    Raw,       // raw bytes, no element interpretation
 }
 
 impl DType {
@@ -39,7 +41,7 @@ impl DType {
         match self {
             DType::F32 => 4,
             DType::F16 => 2,
-            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Raw => 1, // byte-level
+            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Raw => 1, // byte-level
         }
     }
 }
@@ -252,6 +254,89 @@ impl Gpu {
         }
     }
 
+    /// Fused QKV: three Q4_K GEMVs in one launch (saves 2 kernel launches per layer).
+    /// q = Wq * x, k = Wk * x, v = Wv * x — all read the same input x.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_qkv_q4k(
+        &mut self,
+        wq: &GpuTensor, wk: &GpuTensor, wv: &GpuTensor,
+        x: &GpuTensor,
+        yq: &GpuTensor, yk: &GpuTensor, yv: &GpuTensor,
+        q_m: usize, k_m: usize, v_m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("fused_qkv_q4k", kernels::FUSED_QKV_Q4K_SRC, "fused_qkv_q4k")?;
+        let func = &self.functions["fused_qkv_q4k"];
+
+        let mut aq = wq.buf.as_ptr();
+        let mut ak = wk.buf.as_ptr();
+        let mut av = wv.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yqp = yq.buf.as_ptr();
+        let mut ykp = yk.buf.as_ptr();
+        let mut yvp = yv.buf.as_ptr();
+        let mut qm = q_m as i32;
+        let mut km = k_m as i32;
+        let mut vm = v_m as i32;
+        let mut kk = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aq as *mut _ as *mut c_void,
+            &mut ak as *mut _ as *mut c_void,
+            &mut av as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yqp as *mut _ as *mut c_void,
+            &mut ykp as *mut _ as *mut c_void,
+            &mut yvp as *mut _ as *mut c_void,
+            &mut qm as *mut _ as *mut c_void,
+            &mut km as *mut _ as *mut c_void,
+            &mut vm as *mut _ as *mut c_void,
+            &mut kk as *mut _ as *mut c_void,
+        ];
+
+        let grid = (q_m + k_m + v_m) as u32;
+        unsafe {
+            self.hip.launch_kernel(func, [grid, 1, 1], [32, 1, 1], 0, None, &mut params)
+        }
+    }
+
+    /// Fused Gate+Up: two Q4_K GEMVs in one launch (saves 1 kernel launch per layer).
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_gate_up_q4k(
+        &mut self,
+        w_gate: &GpuTensor, w_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor, y_up: &GpuTensor,
+        gate_m: usize, up_m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("fused_gate_up_q4k", kernels::FUSED_GATE_UP_Q4K_SRC, "fused_gate_up_q4k")?;
+        let func = &self.functions["fused_gate_up_q4k"];
+
+        let mut ag = w_gate.buf.as_ptr();
+        let mut au = w_up.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut ygp = y_gate.buf.as_ptr();
+        let mut yup = y_up.buf.as_ptr();
+        let mut gm = gate_m as i32;
+        let mut um = up_m as i32;
+        let mut kk = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ag as *mut _ as *mut c_void,
+            &mut au as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut ygp as *mut _ as *mut c_void,
+            &mut yup as *mut _ as *mut c_void,
+            &mut gm as *mut _ as *mut c_void,
+            &mut um as *mut _ as *mut c_void,
+            &mut kk as *mut _ as *mut c_void,
+        ];
+
+        let grid = (gate_m + up_m) as u32;
+        unsafe {
+            self.hip.launch_kernel(func, [grid, 1, 1], [32, 1, 1], 0, None, &mut params)
+        }
+    }
+
     /// y = A_q8_0 * x (quantized GEMV for Q8_0)
     pub fn gemv_q8_0(
         &mut self,
@@ -325,6 +410,129 @@ impl Gpu {
                 [m as u32, 1, 1],
                 [block_size, 1, 1],
                 shared_mem,
+                None,
+                &mut params,
+            )
+        }
+    }
+
+    /// y = A_q4f16 * x (RDNA-native Q4_F16 GEMV, group size 64)
+    /// a_raw: raw Q4_F16_G64 bytes on GPU, x: F32 input, y: F32 output
+    /// Block: 36 bytes per 64 elements. K must be multiple of 64.
+    /// Uses 128 threads (4 warps) with shared memory reduction for increased MLP.
+    pub fn gemv_q4f16_g64(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("gemv_q4f16_g64", kernels::GEMV_Q4F16_G64_SRC, "gemv_q4f16_g64")?;
+        let func = &self.functions["gemv_q4f16_g64"];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        let block_size = 32u32; // single warp — no shared memory
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, 1, 1],
+                [block_size, 1, 1],
+                0,
+                None,
+                &mut params,
+            )
+        }
+    }
+
+    /// y = A_q4f16 * x (256-thread wide variant for occupancy testing)
+    /// Element-strided access pattern matching F32 GEMV. Shared memory reduction.
+    pub fn gemv_q4f16_g64_wide(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("gemv_q4f16_g64_wide", kernels::GEMV_Q4F16_G64_WIDE_SRC, "gemv_q4f16_g64_wide")?;
+        let func = &self.functions["gemv_q4f16_g64_wide"];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        let block_size = 256u32;
+        let shared_mem = block_size * 4; // one float per thread
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, 1, 1],
+                [block_size, 1, 1],
+                shared_mem,
+                None,
+                &mut params,
+            )
+        }
+    }
+
+    /// y = A_q4f16 * x (RDNA-native Q4_F16 GEMV, group size 32)
+    /// Block: 20 bytes per 32 elements. K must be multiple of 32.
+    pub fn gemv_q4f16_g32(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("gemv_q4f16_g32", kernels::GEMV_Q4F16_G32_SRC, "gemv_q4f16_g32")?;
+        let func = &self.functions["gemv_q4f16_g32"];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        let block_size = 32u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, 1, 1],
+                [block_size, 1, 1],
+                0,
                 None,
                 &mut params,
             )

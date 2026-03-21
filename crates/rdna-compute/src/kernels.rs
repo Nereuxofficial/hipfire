@@ -175,28 +175,171 @@ extern "C" __global__ void gemv_q4k(
 }
 "#;
 
+/// Fused QKV Q4_K: three GEMVs in one kernel launch.
+/// Grid = (q_m + k_m + v_m) blocks. Each block determines which matrix by blockIdx range.
+/// All three projections read the same input x (cached). Saves 2 kernel launches per layer.
+pub const FUSED_QKV_Q4K_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+__launch_bounds__(32, 20)
+extern "C" __global__ void fused_qkv_q4k(
+    const unsigned char* __restrict__ A_q,
+    const unsigned char* __restrict__ A_k,
+    const unsigned char* __restrict__ A_v,
+    const float* __restrict__ x,
+    float* __restrict__ y_q,
+    float* __restrict__ y_k,
+    float* __restrict__ y_v,
+    int q_m, int k_m, int v_m, int K
+) {
+    const int gid = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    // Determine which matrix this block processes
+    const unsigned char* A;
+    float* y;
+    int local_row;
+    if (gid < q_m) {
+        A = A_q; y = y_q; local_row = gid;
+    } else if (gid < q_m + k_m) {
+        A = A_k; y = y_k; local_row = gid - q_m;
+    } else {
+        A = A_v; y = y_v; local_row = gid - q_m - k_m;
+    }
+
+    const int blocks_per_row = K / 256;
+    const unsigned char* row_data = A + (size_t)local_row * blocks_per_row * 144;
+
+    float sum = 0.0f;
+
+    for (int bi = 0; bi < blocks_per_row; bi++) {
+        const unsigned char* block = row_data + bi * 144;
+        float d = (float)*((const _Float16*)block);
+        float dmin = (float)*((const _Float16*)(block + 2));
+        const unsigned char* sc = block + 4;
+        const float* xb = x + bi * 256;
+
+        {
+            unsigned char qbyte = block[16 + tid];
+            float s0 = d * (float)(sc[0] & 63);
+            float m0 = dmin * (float)(sc[4] & 63);
+            sum += (s0 * (float)(qbyte & 0xF) - m0) * xb[tid];
+            float s1 = d * (float)(sc[1] & 63);
+            float m1 = dmin * (float)(sc[5] & 63);
+            sum += (s1 * (float)(qbyte >> 4) - m1) * xb[32 + tid];
+        }
+        {
+            unsigned char qbyte = block[48 + tid];
+            float s2 = d * (float)(sc[2] & 63);
+            float m2 = dmin * (float)(sc[6] & 63);
+            sum += (s2 * (float)(qbyte & 0xF) - m2) * xb[64 + tid];
+            float s3 = d * (float)(sc[3] & 63);
+            float m3 = dmin * (float)(sc[7] & 63);
+            sum += (s3 * (float)(qbyte >> 4) - m3) * xb[96 + tid];
+        }
+        {
+            unsigned char qbyte = block[80 + tid];
+            float s4 = d * (float)((sc[8] & 0xF) | ((sc[0] >> 6) << 4));
+            float m4 = dmin * (float)((sc[8] >> 4) | ((sc[4] >> 6) << 4));
+            sum += (s4 * (float)(qbyte & 0xF) - m4) * xb[128 + tid];
+            float s5 = d * (float)((sc[9] & 0xF) | ((sc[1] >> 6) << 4));
+            float m5 = dmin * (float)((sc[9] >> 4) | ((sc[5] >> 6) << 4));
+            sum += (s5 * (float)(qbyte >> 4) - m5) * xb[160 + tid];
+        }
+        {
+            unsigned char qbyte = block[112 + tid];
+            float s6 = d * (float)((sc[10] & 0xF) | ((sc[2] >> 6) << 4));
+            float m6 = dmin * (float)((sc[10] >> 4) | ((sc[6] >> 6) << 4));
+            sum += (s6 * (float)(qbyte & 0xF) - m6) * xb[192 + tid];
+            float s7 = d * (float)((sc[11] & 0xF) | ((sc[3] >> 6) << 4));
+            float m7 = dmin * (float)((sc[11] >> 4) | ((sc[7] >> 6) << 4));
+            sum += (s7 * (float)(qbyte >> 4) - m7) * xb[224 + tid];
+        }
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down(sum, offset);
+    }
+    if (tid == 0) y[local_row] = sum;
+}
+"#;
+
+/// Fused Gate+Up Q4_K: two GEMVs in one kernel launch for FFN gate and up projections.
+/// Grid = (gate_m + up_m) blocks. Saves 1 kernel launch per layer.
+pub const FUSED_GATE_UP_Q4K_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+__launch_bounds__(32, 20)
+extern "C" __global__ void fused_gate_up_q4k(
+    const unsigned char* __restrict__ A_gate,
+    const unsigned char* __restrict__ A_up,
+    const float* __restrict__ x,
+    float* __restrict__ y_gate,
+    float* __restrict__ y_up,
+    int gate_m, int up_m, int K
+) {
+    const int gid = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    const unsigned char* A;
+    float* y;
+    int local_row;
+    if (gid < gate_m) {
+        A = A_gate; y = y_gate; local_row = gid;
+    } else {
+        A = A_up; y = y_up; local_row = gid - gate_m;
+    }
+
+    const int blocks_per_row = K / 256;
+    const unsigned char* row_data = A + (size_t)local_row * blocks_per_row * 144;
+
+    float sum = 0.0f;
+
+    for (int bi = 0; bi < blocks_per_row; bi++) {
+        const unsigned char* block = row_data + bi * 144;
+        float d = (float)*((const _Float16*)block);
+        float dmin = (float)*((const _Float16*)(block + 2));
+        const unsigned char* sc = block + 4;
+        const float* xb = x + bi * 256;
+
+        {
+            unsigned char qbyte = block[16 + tid];
+            sum += (d * (float)(sc[0] & 63) * (float)(qbyte & 0xF) - dmin * (float)(sc[4] & 63)) * xb[tid];
+            sum += (d * (float)(sc[1] & 63) * (float)(qbyte >> 4) - dmin * (float)(sc[5] & 63)) * xb[32 + tid];
+        }
+        {
+            unsigned char qbyte = block[48 + tid];
+            sum += (d * (float)(sc[2] & 63) * (float)(qbyte & 0xF) - dmin * (float)(sc[6] & 63)) * xb[64 + tid];
+            sum += (d * (float)(sc[3] & 63) * (float)(qbyte >> 4) - dmin * (float)(sc[7] & 63)) * xb[96 + tid];
+        }
+        {
+            unsigned char qbyte = block[80 + tid];
+            sum += (d * (float)((sc[8] & 0xF) | ((sc[0] >> 6) << 4)) * (float)(qbyte & 0xF) - dmin * (float)((sc[8] >> 4) | ((sc[4] >> 6) << 4))) * xb[128 + tid];
+            sum += (d * (float)((sc[9] & 0xF) | ((sc[1] >> 6) << 4)) * (float)(qbyte >> 4) - dmin * (float)((sc[9] >> 4) | ((sc[5] >> 6) << 4))) * xb[160 + tid];
+        }
+        {
+            unsigned char qbyte = block[112 + tid];
+            sum += (d * (float)((sc[10] & 0xF) | ((sc[2] >> 6) << 4)) * (float)(qbyte & 0xF) - dmin * (float)((sc[10] >> 4) | ((sc[6] >> 6) << 4))) * xb[192 + tid];
+            sum += (d * (float)((sc[11] & 0xF) | ((sc[3] >> 6) << 4)) * (float)(qbyte >> 4) - dmin * (float)((sc[11] >> 4) | ((sc[7] >> 6) << 4))) * xb[224 + tid];
+        }
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down(sum, offset);
+    }
+    if (tid == 0) y[local_row] = sum;
+}
+"#;
+
 /// GEMV Q8_0: matrix-vector multiply with on-the-fly Q8_0 dequantization.
 /// Q8_0 block: 2 bytes f16 scale + 32 bytes int8 = 34 bytes per 32 elements.
+/// v3: Processes 8 blocks (256 elements) per outer iteration to match Q4_K's loop count.
+/// Byte loads → no nibble extraction → 16 VGPRs → F32-class occupancy.
 pub const GEMV_Q8_0_SRC: &str = r#"
 #include <hip/hip_runtime.h>
 
-__device__ __forceinline__ float half_to_float_q8(unsigned short h) {
-    unsigned int sign = (h >> 15) & 1;
-    unsigned int exp  = (h >> 10) & 0x1F;
-    unsigned int frac = h & 0x3FF;
-    if (exp == 0) {
-        if (frac == 0) return __int_as_float(sign << 31);
-        while (!(frac & 0x400)) { frac <<= 1; exp--; }
-        frac &= 0x3FF;
-        exp = 127 - 15 + 1 + exp;
-        return __int_as_float((sign << 31) | (exp << 23) | (frac << 13));
-    }
-    if (exp == 31) return __int_as_float((sign << 31) | (0xFF << 23) | (frac ? (frac << 13 | 1) : 0));
-    return __int_as_float((sign << 31) | ((exp + 127 - 15) << 23) | (frac << 13));
-}
-
-// Q8_0 GEMV v2: 32 threads (single warp), warp shuffle. No shared memory.
-// Each thread handles element tid within each Q8_0 block, iterating over blocks.
+// Q8_0 GEMV v3: 32 threads, 8 blocks/iteration (256 elements), warp shuffle.
+// Unrolled 8x to amortize loop overhead. Each thread processes 8 elements per iteration.
 __launch_bounds__(32, 20)
 extern "C" __global__ void gemv_q8_0(
     const unsigned char* __restrict__ A_q8,
@@ -213,7 +356,24 @@ extern "C" __global__ void gemv_q8_0(
 
     float sum = 0.0f;
 
-    for (int bi = 0; bi < blocks_per_row; bi++) {
+    // Process 8 Q8_0 blocks (256 elements) per outer iteration
+    const int outer_iters = blocks_per_row / 8;
+    for (int oi = 0; oi < outer_iters; oi++) {
+        const unsigned char* base = row_data + oi * 8 * 34;
+        const float* xb = x + oi * 256;
+
+        // Unrolled: 8 blocks, each: load scale (f16→f32), load byte, FMA
+        #pragma unroll
+        for (int sub = 0; sub < 8; sub++) {
+            const unsigned char* block = base + sub * 34;
+            float d = (float)*((const _Float16*)block);
+            signed char qval = (signed char)block[2 + tid];
+            sum += d * (float)qval * xb[sub * 32 + tid];
+        }
+    }
+
+    // Handle remaining blocks (if K is not multiple of 256)
+    for (int bi = outer_iters * 8; bi < blocks_per_row; bi++) {
         const unsigned char* block = row_data + bi * 34;
         float d = (float)*((const _Float16*)block);
         signed char qval = (signed char)block[2 + tid];
@@ -599,5 +759,156 @@ extern "C" __global__ void attention_f32(
         }
         out_head[d] = val;
     }
+}
+"#;
+
+/// GEMV Q4_F16_G64: matrix-vector multiply with on-the-fly Q4_F16 dequantization.
+/// Block layout: f16 scale (2B) + f16 min (2B) + uint8 quants[32] (32B) = 36 bytes per 64 elements.
+/// Dequant: weight = (_Float16)(nibble) * scale + min — single FP16 FMA on RDNA.
+/// Thread tid reads quants[tid], processes both nibbles (elements tid and tid+32).
+pub const GEMV_Q4F16_G64_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+// Q4_F16 group-64 GEMV: y = A * x
+// 32 threads (single warp), warp shuffle reduction, no shared memory.
+// FP16 dequant via native _Float16 FMA, FP32 accumulate for precision.
+__launch_bounds__(32, 20)
+extern "C" __global__ void gemv_q4f16_g64(
+    const unsigned char* __restrict__ A_q4f16,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K
+) {
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const int tid = threadIdx.x;
+
+    const int blocks_per_row = K / 64;
+    const unsigned char* row_data = A_q4f16 + (size_t)row * blocks_per_row * 36;
+
+    float sum = 0.0f;
+
+    for (int bi = 0; bi < blocks_per_row; bi++) {
+        const unsigned char* block = row_data + bi * 36;
+
+        // Load scale and min — broadcast across warp via L0 cache
+        _Float16 scale = *(const _Float16*)(block);
+        _Float16 mn    = *(const _Float16*)(block + 2);
+
+        // Each thread reads one byte, extracts both nibbles
+        unsigned char qbyte = block[4 + tid];
+
+        // Lower nibble -> element tid within block
+        unsigned int nib_lo = qbyte & 0xF;
+        _Float16 w0 = (_Float16)((unsigned short)nib_lo) * scale + mn;
+        sum += (float)w0 * x[bi * 64 + tid];
+
+        // Upper nibble -> element tid+32 within block
+        unsigned int nib_hi = qbyte >> 4;
+        _Float16 w1 = (_Float16)((unsigned short)nib_hi) * scale + mn;
+        sum += (float)w1 * x[bi * 64 + 32 + tid];
+    }
+
+    // Warp shuffle reduction (5 steps for 32 threads)
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down(sum, offset);
+    }
+    if (tid == 0) y[row] = sum;
+}
+"#;
+
+/// GEMV Q4_F16_G64 wide: 256 threads, element-strided access, shared memory reduction.
+/// Matches F32 GEMV's occupancy pattern to test whether occupancy explains the 40% vs 48% gap.
+/// Each thread processes elements tid, tid+256, tid+512, ... across the row.
+pub const GEMV_Q4F16_G64_WIDE_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void gemv_q4f16_g64_wide(
+    const unsigned char* __restrict__ A_q4f16,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K
+) {
+    extern __shared__ float sdata[];
+
+    const int row = blockIdx.x;
+    if (row >= M) return;
+
+    const int blocks_per_row = K / 64;
+    const unsigned char* row_data = A_q4f16 + (size_t)row * blocks_per_row * 36;
+
+    float sum = 0.0f;
+
+    // Element-strided: thread tid handles elements tid, tid+blockDim.x, ...
+    for (int elem = threadIdx.x; elem < K; elem += blockDim.x) {
+        int block_idx = elem >> 6;           // elem / 64 (shift since 64 = 2^6)
+        int within = elem & 63;              // elem % 64
+
+        const unsigned char* block = row_data + block_idx * 36;
+        _Float16 scale = *(const _Float16*)(block);
+        _Float16 mn    = *(const _Float16*)(block + 2);
+
+        // Nibble extraction: elements 0-31 use lower nibble, 32-63 use upper
+        int byte_idx = within & 31;          // within < 32 ? within : within - 32
+        unsigned char qbyte = block[4 + byte_idx];
+        unsigned int nibble = (within < 32) ? (qbyte & 0xF) : (qbyte >> 4);
+
+        _Float16 w = (_Float16)((unsigned short)nibble) * scale + mn;
+        sum += (float)w * x[elem];
+    }
+
+    // Shared memory tree reduction (same as F32 GEMV)
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) y[row] = sdata[0];
+}
+"#;
+
+/// GEMV Q4_F16_G32: matrix-vector multiply with Q4_F16 group-32 dequantization.
+/// Block layout: f16 scale (2B) + f16 min (2B) + uint8 quants[16] (16B) = 20 bytes per 32 elements.
+/// Thread tid reads quants[tid&15], extracts its nibble based on tid < 16 or >= 16.
+pub const GEMV_Q4F16_G32_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+// Q4_F16 group-32 GEMV: y = A * x
+// 32 threads (single warp), 1 element per thread per block.
+__launch_bounds__(32, 20)
+extern "C" __global__ void gemv_q4f16_g32(
+    const unsigned char* __restrict__ A_q4f16,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K
+) {
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const int tid = threadIdx.x;
+
+    const int blocks_per_row = K / 32;
+    const unsigned char* row_data = A_q4f16 + (size_t)row * blocks_per_row * 20;
+
+    float sum = 0.0f;
+
+    for (int bi = 0; bi < blocks_per_row; bi++) {
+        const unsigned char* block = row_data + bi * 20;
+
+        _Float16 scale = *(const _Float16*)(block);
+        _Float16 mn    = *(const _Float16*)(block + 2);
+
+        // Threads 0-15 read lower nibble, 16-31 read upper nibble of same byte
+        unsigned char qbyte = block[4 + (tid & 15)];
+        unsigned int nibble = (tid < 16) ? (qbyte & 0xF) : (qbyte >> 4);
+
+        _Float16 w = (_Float16)((unsigned short)nibble) * scale + mn;
+        sum += (float)w * x[bi * 32 + tid];
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down(sum, offset);
+    }
+    if (tid == 0) y[row] = sum;
 }
 "#;
