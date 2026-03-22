@@ -618,6 +618,19 @@ pub fn prefill_forward(
     }
     gpu.free_tensor(x_single)?;
 
+    // Position array for batched RoPE: [0, 1, 2, ..., batch-1]
+    let pos_data: Vec<i32> = (0..batch as i32).collect();
+    let pos_bytes: Vec<u8> = pos_data.iter().flat_map(|p| p.to_ne_bytes()).collect();
+    let pos_array = gpu.alloc_tensor(&[batch], DType::F32)?;  // i32 same size as f32
+    gpu.hip.memcpy_htod(&pos_array.buf, &pos_bytes)?;
+
+    // Per-position scratch buffers (reused across all layers)
+    let q_slice = gpu.alloc_tensor(&[q_dim], DType::F32)?;
+    let k_slice = gpu.alloc_tensor(&[kv_dim], DType::F32)?;
+    let v_slice = gpu.alloc_tensor(&[kv_dim], DType::F32)?;
+    let attn_slice = gpu.alloc_tensor(&[q_dim], DType::F32)?;
+    let pos_buf = gpu.hip.malloc(4)?;
+
     // Layer loop
     for layer_idx in 0..config.n_layers {
         let layer = &weights.layers[layer_idx];
@@ -644,45 +657,29 @@ pub fn prefill_forward(
             }
         }
 
-        // RoPE + KV cache + Attention: sequential per position (correctness first)
-        let q_slice = gpu.alloc_tensor(&[q_dim], DType::F32)?;
-        let k_slice = gpu.alloc_tensor(&[kv_dim], DType::F32)?;
-        let v_slice = gpu.alloc_tensor(&[kv_dim], DType::F32)?;
-        let attn_slice = gpu.alloc_tensor(&[q_dim], DType::F32)?;
-        let pos_buf = gpu.hip.malloc(4)?;
+        // Batched RoPE: all positions in one kernel launch
+        gpu.rope_batched_f32(&q_batch, &k_batch, &pos_array,
+            n_heads, n_kv_heads, head_dim, config.rope_freq_base, batch)?;
 
+        // KV cache + Attention: still sequential per position
         for i in 0..batch {
             let pos_i32 = i as i32;
             gpu.hip.memcpy_htod(&pos_buf, &pos_i32.to_ne_bytes())?;
 
-            // Copy position i's Q, K, V from batch buffers
-            gpu.hip.memcpy_dtod_at(&q_slice.buf, 0, &q_batch.buf, i * q_dim * 4, q_dim * 4)?;
+            // Copy position i's K, V from batch buffers into KV cache
             gpu.hip.memcpy_dtod_at(&k_slice.buf, 0, &k_batch.buf, i * kv_dim * 4, kv_dim * 4)?;
             gpu.hip.memcpy_dtod_at(&v_slice.buf, 0, &v_batch.buf, i * kv_dim * 4, kv_dim * 4)?;
-
-            // RoPE
-            gpu.rope_f32(&q_slice, &k_slice, &pos_buf, n_heads, n_kv_heads, head_dim, config.rope_freq_base)?;
-
-            // Write back RoPE'd Q (needed for attention below)
-            gpu.hip.memcpy_dtod_at(&q_batch.buf, i * q_dim * 4, &q_slice.buf, 0, q_dim * 4)?;
-
-            // KV cache write
             gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &k_slice, &pos_buf, kv_dim)?;
             gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &v_slice, &pos_buf, kv_dim)?;
 
             // Attention (causal: position i sees 0..=i)
+            gpu.hip.memcpy_dtod_at(&q_slice.buf, 0, &q_batch.buf, i * q_dim * 4, q_dim * 4)?;
             gpu.attention_f32(
                 &q_slice, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                 &attn_slice, &pos_buf, i + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
             )?;
             gpu.hip.memcpy_dtod_at(&attn_out_batch.buf, i * q_dim * 4, &attn_slice.buf, 0, q_dim * 4)?;
         }
-
-        gpu.free_tensor(q_slice)?;
-        gpu.free_tensor(k_slice)?;
-        gpu.free_tensor(v_slice)?;
-        gpu.free_tensor(attn_slice)?;
-        gpu.hip.free(pos_buf)?;
 
         // Batched output projection
         weight_gemm(gpu, &layer.wo, &attn_out_batch, &o_batch, batch)?;
@@ -706,6 +703,14 @@ pub fn prefill_forward(
         // Batched residual
         gpu.add_inplace_f32(&x_batch, &ffn_out_batch)?;
     }
+
+    // Free per-position scratch
+    gpu.free_tensor(pos_array)?;
+    gpu.free_tensor(q_slice)?;
+    gpu.free_tensor(k_slice)?;
+    gpu.free_tensor(v_slice)?;
+    gpu.free_tensor(attn_slice)?;
+    gpu.hip.free(pos_buf)?;
 
     // Final norm + output projection for LAST position only
     let last_off = (batch - 1) * dim * 4;

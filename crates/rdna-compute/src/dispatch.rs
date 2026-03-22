@@ -1317,6 +1317,41 @@ impl Gpu {
         }
     }
 
+    /// Batched RoPE: apply to [batch_size] positions in one launch.
+    /// q: [batch_size × q_dim], k: [batch_size × kv_dim].
+    /// positions: GPU buffer of [batch_size] i32 position indices.
+    pub fn rope_batched_f32(
+        &mut self, q: &GpuTensor, k: &GpuTensor, positions: &GpuTensor,
+        n_heads_q: usize, n_heads_k: usize, head_dim: usize, freq_base: f32, batch_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("rope_batched", kernels::ROPE_BATCHED_SRC, "rope_batched_f32")?;
+        let func = &self.functions["rope_batched_f32"];
+        let mut q_ptr = q.buf.as_ptr();
+        let mut k_ptr = k.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut nhq = n_heads_q as i32;
+        let mut nhk = n_heads_k as i32;
+        let mut hd = head_dim as i32;
+        let mut fb = freq_base;
+        let mut bs = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut nhq as *mut _ as *mut c_void,
+            &mut nhk as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut fb as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        let half = (head_dim / 2) as u32;
+        let block = 256u32.min(half);
+        let grid_x = (half + block - 1) / block;
+        unsafe {
+            self.hip.launch_kernel(func, [grid_x, batch_size as u32, 1], [block, 1, 1], 0, self.stream_ref(), &mut params)
+        }
+    }
+
     /// GPU-side GQA attention.
     /// pos_buf: GPU buffer with single i32 position. Kernel computes seq_len = pos_buf[0] + 1.
     /// seq_len_hint: host-side seq_len for shared memory sizing (= pos + 1).
