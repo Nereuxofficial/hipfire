@@ -769,10 +769,13 @@ fn main() {
             let this_q4k = use_q4k_all || use_q4k_q8embed || use_mixed;
 
             let (quantized, qt, gs, label) = if use_hfq4g256 {
-                // Auto-select G128 vs G256 based on K dimension
-                // G128 for K < 4096 (better quality), G256 for K >= 4096 (better coalescing)
+                // Mixed HFQ4: G128 for attention, G256 for everything else
+                let is_attn = name.contains("q_proj") || name.contains("k_proj")
+                    || name.contains("v_proj") || name.contains("o_proj")
+                    || name.contains("attn_q") || name.contains("attn_k")
+                    || name.contains("attn_v") || name.contains("attn_output");
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim >= 4096 && k_dim % 256 == 0 {
+                if !is_attn && k_dim >= 4096 && k_dim % 256 == 0 {
                     let q = quantize_hfq4g256(&f32_data);
                     (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
                 } else {

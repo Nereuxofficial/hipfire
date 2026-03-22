@@ -30,3 +30,4 @@ experiment	task	kernel	tok_s	throughput	pct_peak	correctness	peak_vram_mb	descri
 28	phase5-hfq4	bugfix	-	-	-	-	-	Root cause: corrupt .hsaco kernel cache from killed processes. Fix: source hash check.	YES
 29	phase5-hfq4	qwen06b_g128	155.8	-	-	GOOD	~436	Qwen3-0.6B HFQ4-G128: 220 tok/s short, 155.8 tok/s 457tok thermo. Coherent. Auto G128 for K<4096.	YES
 30	phase5-hfq4	tinyllama_g128	235.4	-	-	OK	~613	TinyLlama HFQ4-G128: 235 tok/s, completions work (no chat template). Auto G128 for K<4096.	YES
+31	phase5-hfq4	qwen8b_mixed	38.5	-	-	GOOD	~4399	Qwen3-8B mixed G128attn+G256ffn: 52.1 short, 38.5 698tok thermo. Between G256-all and Q4K.	YES
