@@ -6,9 +6,18 @@ use engine::llama::{self, LlamaConfig, KvCache};
 use engine::tokenizer::Tokenizer;
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+static RUNNING: AtomicBool = AtomicBool::new(true);
+
+extern "C" fn handle_sigint(_: libc::c_int) {
+    RUNNING.store(false, Ordering::SeqCst);
+}
+
 fn main() {
+    unsafe { libc::signal(libc::SIGINT, handle_sigint as libc::sighandler_t); }
+
     let args: Vec<String> = std::env::args().collect();
     let model_path = args
         .get(1)
@@ -105,7 +114,7 @@ fn main() {
         print!("{text}");
         std::io::stdout().flush().ok();
 
-        if next_token == config.eos_token {
+        if next_token == config.eos_token || !RUNNING.load(Ordering::Relaxed) {
             break;
         }
 

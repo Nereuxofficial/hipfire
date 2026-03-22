@@ -5,9 +5,14 @@ use engine::hfq::{self, HfqFile};
 use engine::llama::{self, KvCache};
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+static RUNNING: AtomicBool = AtomicBool::new(true);
+extern "C" fn handle_sigint(_: libc::c_int) { RUNNING.store(false, Ordering::SeqCst); }
+
 fn main() {
+    unsafe { libc::signal(libc::SIGINT, handle_sigint as libc::sighandler_t); }
     let args: Vec<String> = std::env::args().collect();
     let model_path = args.get(1)
         .unwrap_or_else(|| { eprintln!("Usage: infer_hfq <model.hfq> [--temp T] [--debug] [prompt...]"); std::process::exit(1); });
@@ -18,13 +23,19 @@ fn main() {
         .unwrap_or(0.7);
     let debug = args.iter().any(|a| a == "--debug");
     let top_p: f32 = if temp == 0.0 { 1.0 } else { 0.8 };
+    let repeat_penalty: f32 = args.iter().position(|a| a == "--repeat-penalty")
+        .map(|i| args[i + 1].parse().unwrap_or(1.1)).unwrap_or(1.1);
+    let repeat_window: usize = args.iter().position(|a| a == "--repeat-window")
+        .map(|i| args[i + 1].parse().unwrap_or(64)).unwrap_or(64);
 
     // Collect prompt text (skip flags)
     let mut prompt_parts = Vec::new();
     let mut skip_next = false;
     for (_i, a) in args.iter().enumerate().skip(2) {
         if skip_next { skip_next = false; continue; }
-        if a == "--temp" || a == "--debug" { if a == "--temp" { skip_next = true; } continue; }
+        if a == "--temp" || a == "--debug" || a == "--repeat-penalty" || a == "--repeat-window" {
+            if a != "--debug" { skip_next = true; } continue;
+        }
         prompt_parts.push(a.as_str());
     }
     let prompt_text = if prompt_parts.is_empty() { "Hello".to_string() } else { prompt_parts.join(" ") };
@@ -105,12 +116,22 @@ fn main() {
         .duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos();
     if rng_state == 0 { rng_state = 1; }
 
-    // Process prompt
+    // Seed token history with prompt tokens for repeat penalty
+    let mut token_history: Vec<u32> = prompt_tokens.clone();
+
+    // Process prompt (with repeat penalty to influence first sampled token)
     let t1 = Instant::now();
-    for (pos, &token) in prompt_tokens.iter().enumerate() {
+    for (i, (pos, &token)) in prompt_tokens.iter().enumerate().enumerate() {
+        let hist_start = token_history[..i].len().saturating_sub(repeat_window);
+        let hist_slice = &token_history[hist_start..i];
+        if !hist_slice.is_empty() {
+            let hist_bytes: Vec<u8> = hist_slice.iter().flat_map(|t| t.to_ne_bytes()).collect();
+            gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &hist_bytes).unwrap();
+        }
         let (_, rng) = llama::forward_scratch(
             &mut gpu, &weights, &config, token, pos, &mut kv_cache,
             &scratch, temp.max(0.01), top_p, rng_state,
+            hist_slice.len(), repeat_penalty,
         ).expect("forward_scratch failed");
         rng_state = rng;
     }
@@ -142,14 +163,22 @@ fn main() {
                 generated.len(), pos, next_token, text);
         }
 
-        if next_token == config.eos_token {
+        if next_token == config.eos_token || !RUNNING.load(Ordering::Relaxed) {
             break;
         }
+
+        // Upload recent token history for repetition penalty
+        token_history.push(next_token);
+        let hist_start = token_history.len().saturating_sub(repeat_window);
+        let hist_slice = &token_history[hist_start..];
+        let hist_bytes: Vec<u8> = hist_slice.iter().flat_map(|t| t.to_ne_bytes()).collect();
+        gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &hist_bytes).unwrap();
 
         let pos = prompt_tokens.len() + generated.len() - 1;
         let (tok, rng) = llama::forward_scratch(
             &mut gpu, &weights, &config, next_token, pos, &mut kv_cache,
             &scratch, temp.max(0.01), top_p, rng_state,
+            hist_slice.len(), repeat_penalty,
         ).expect("forward_scratch failed");
         next_token = tok;
         rng_state = rng;

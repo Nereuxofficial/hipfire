@@ -679,6 +679,7 @@ pub struct ForwardScratch {
     pub ffn_out: GpuTensor,
     pub logits: GpuTensor,
     pub sample_buf: GpuTensor,
+    pub repeat_buf: GpuTensor,
     pub pos_buf: hip_bridge::DeviceBuffer,
 }
 
@@ -701,6 +702,7 @@ impl ForwardScratch {
             ffn_out: gpu.alloc_tensor(&[dim], DType::F32)?,
             logits: gpu.alloc_tensor(&[config.vocab_size], DType::F32)?,
             sample_buf: gpu.alloc_tensor(&[2], DType::F32)?,
+            repeat_buf: gpu.alloc_tensor(&[64], DType::F32)?,
             pos_buf: gpu.hip.malloc(4)?,  // single i32
         })
     }
@@ -719,9 +721,11 @@ pub fn forward_scratch(
     temperature: f32,
     top_p: f32,
     rng_state: u32,
+    repeat_window: usize,
+    repeat_penalty: f32,
 ) -> HipResult<(u32, u32)> {
     forward_scratch_embed(gpu, weights, config, token, pos, scratch)?;
-    forward_scratch_layers(gpu, weights, config, pos, kv_cache, scratch, temperature, top_p, rng_state)
+    forward_scratch_layers(gpu, weights, config, pos, kv_cache, scratch, temperature, top_p, rng_state, repeat_window, repeat_penalty)
 }
 
 /// Upload pos and compute embedding. Must be called before forward_scratch_layers.
@@ -759,6 +763,8 @@ pub fn forward_scratch_layers(
     temperature: f32,
     top_p: f32,
     rng_state: u32,
+    repeat_window: usize,
+    repeat_penalty: f32,
 ) -> HipResult<(u32, u32)> {
     let n_heads = config.n_heads;
     let n_kv_heads = config.n_kv_heads;
@@ -826,8 +832,9 @@ pub fn forward_scratch_layers(
 
     // GPU-side sampling (includes sync readback — can't be in graph capture)
     gpu.sample_top_p(
-        &scratch.logits, &scratch.sample_buf,
+        &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
         config.vocab_size, temperature, top_p, rng_state,
+        repeat_window, repeat_penalty,
     )
 }
 
@@ -1069,19 +1076,19 @@ pub fn forward_sample(
     pos: usize,
     kv_cache: &mut KvCache,
     sample_buf: &GpuTensor,
+    repeat_buf: &GpuTensor,
     temperature: f32,
     top_p: f32,
     rng_state: u32,
+    repeat_window: usize,
+    repeat_penalty: f32,
 ) -> HipResult<(u32, u32)> {
-    // Run forward pass to get logits on GPU
     let logits_on_gpu = forward_logits_gpu(gpu, weights, config, token, pos, kv_cache)?;
-
-    // Sample on GPU — returns token_id + new rng state
     let result = gpu.sample_top_p(
-        &logits_on_gpu, sample_buf,
+        &logits_on_gpu, sample_buf, repeat_buf,
         config.vocab_size, temperature, top_p, rng_state,
+        repeat_window, repeat_penalty,
     )?;
-
     gpu.free_tensor(logits_on_gpu)?;
     Ok(result)
 }

@@ -1323,12 +1323,15 @@ pub const SAMPLE_TOP_P_SRC: &str = r#"
 #include <hip/hip_runtime.h>
 
 extern "C" __global__ void sample_top_p(
-    const float* __restrict__ logits,   // [vocab_size]
+    float* __restrict__ logits,          // [vocab_size] (modified in-place for repeat penalty)
     unsigned int* __restrict__ result,   // [2]: token_id, rng_state
+    const unsigned int* __restrict__ repeat_tokens, // [repeat_window] recent token IDs
     int vocab_size,
     float temperature,
     float top_p,
-    unsigned int rand_seed
+    unsigned int rand_seed,
+    int repeat_window,
+    float repeat_penalty
 ) {
     extern __shared__ char smem[];
     const int tid = threadIdx.x;
@@ -1344,6 +1347,16 @@ extern "C" __global__ void sample_top_p(
     float* cand_scores = reduce + nthreads;
     int* cand_indices = (int*)(cand_scores + MAX_CAND);
     int* cand_count = cand_indices + MAX_CAND;
+
+    // Phase 0: Apply repetition penalty — only touches repeat_window positions
+    for (int j = tid; j < repeat_window; j += nthreads) {
+        int tok_id = repeat_tokens[j];
+        if (tok_id < vocab_size) {
+            float v = logits[tok_id];
+            logits[tok_id] = (v > 0.0f) ? (v / repeat_penalty) : (v * repeat_penalty);
+        }
+    }
+    __syncthreads();
 
     // Phase 1: Find max logit
     float local_max = -1e30f;
