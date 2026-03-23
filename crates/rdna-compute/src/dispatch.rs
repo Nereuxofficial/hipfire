@@ -1767,6 +1767,33 @@ impl Gpu {
         unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) }
     }
 
+    /// Batched causal attention: all query positions in one launch.
+    /// Q: [seq_len × n_heads × head_dim], K/V: [seq_len × n_kv_heads × head_dim].
+    pub fn attention_causal_batched(
+        &mut self, q: &GpuTensor, k: &GpuTensor, v: &GpuTensor, out: &GpuTensor,
+        seq_len: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("attention_causal_batched", kernels::ATTENTION_CAUSAL_BATCHED_SRC, "attention_causal_batched")?;
+        let func = &self.functions["attention_causal_batched"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut qp = q.buf.as_ptr(); let mut kp = k.buf.as_ptr();
+        let mut vp = v.buf.as_ptr(); let mut op = out.buf.as_ptr();
+        let mut sl = seq_len as i32; let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32; let mut hd = head_dim as i32; let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void, &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+            &mut sl as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        // Block size: enough threads to cover head_dim and seq_len
+        let block_size = 128u32.min((seq_len.max(head_dim) as u32).next_power_of_two());
+        // Shared: scores[seq_len] + workspace[block_size]
+        let shared_mem = ((seq_len + block_size as usize) * 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, seq_len as u32, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) }
+    }
+
     /// Batched Q8_0 KV cache write: quantize multiple positions in one launch.
     pub fn kv_cache_write_q8_0_batched(
         &mut self, dst: &GpuTensor, src: &GpuTensor, positions: &GpuTensor,

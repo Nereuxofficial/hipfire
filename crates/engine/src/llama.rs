@@ -676,24 +676,11 @@ pub fn prefill_forward(
             }
         }
 
-        // Attention: sequential per position (causal dependency)
-        for i in 0..batch {
-            let pos_i32 = i as i32;
-            gpu.hip.memcpy_htod(&pos_buf, &pos_i32.to_ne_bytes())?;
-            gpu.hip.memcpy_dtod_at(&q_slice.buf, 0, &q_batch.buf, i * q_dim * 4, q_dim * 4)?;
-            if kv_cache.quantized && kv_cache.quant_q8 {
-                gpu.attention_q8_0_kv(
-                    &q_slice, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                    &attn_slice, &pos_buf, i + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
-                )?;
-            } else {
-                gpu.attention_f32(
-                    &q_slice, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                    &attn_slice, &pos_buf, i + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
-                )?;
-            }
-            gpu.hip.memcpy_dtod_at(&attn_out_batch.buf, i * q_dim * 4, &attn_slice.buf, 0, q_dim * 4)?;
-        }
+        // Batched causal attention: one kernel launch for all positions
+        gpu.attention_causal_batched(
+            &q_batch, &k_batch, &v_batch, &attn_out_batch,
+            batch, n_heads, n_kv_heads, head_dim,
+        )?;
 
         // Batched output projection
         weight_gemm(gpu, &layer.wo, &attn_out_batch, &o_batch, batch)?;
