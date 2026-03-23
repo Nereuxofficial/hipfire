@@ -1631,12 +1631,12 @@ impl KvCache {
         Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: true, quant_int8: false, quant_hfq4: false })
     }
 
-    /// Create INT8 co-located KV cache: [f32 scale][int8 × head_dim] = 132 bytes per head.
+    /// Create INT8 co-located KV cache: [f32 scale][pad 4B][int8 × head_dim] = 136 bytes per head.
     pub fn new_gpu_int8c(
         gpu: &mut Gpu, n_layers: usize, n_kv_heads: usize, head_dim: usize, max_seq_len: usize,
     ) -> HipResult<Self> {
         let kv_dim = n_kv_heads * head_dim;
-        let bph = 4 + head_dim; // 132 for head_dim=128
+        let bph = 8 + head_dim; // 136 for head_dim=128 (8-byte header + data)
         let bpp = n_kv_heads * bph;
         let cache_bytes = max_seq_len * bpp;
         let cache_elems = (cache_bytes + 3) / 4;

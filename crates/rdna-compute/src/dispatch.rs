@@ -1665,7 +1665,7 @@ impl Gpu {
             &mut ms as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void,
         ];
         let block_size = (seq_len_hint.max(head_dim) as u32).next_power_of_two().min(256);
-        let shared_mem = ((seq_len_hint + block_size as usize) * 4) as u32;
+        let shared_mem = ((seq_len_hint + block_size as usize + head_dim) * 4) as u32;
         unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) }
     }
 

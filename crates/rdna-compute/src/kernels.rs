@@ -1878,7 +1878,6 @@ extern "C" __global__ void kv_cache_write_int8c(
     const int pos = pos_buf[0];
     const float* head_src = src + h * head_dim;
 
-    // Max absolute value via warp shuffle
     float amax = 0.0f;
     for (int i = tid; i < head_dim; i += 32)
         amax = fmaxf(amax, fabsf(head_src[i]));
@@ -1888,21 +1887,25 @@ extern "C" __global__ void kv_cache_write_int8c(
     float scale = amax / 127.0f;
     float inv = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
 
-    int bph = 4 + head_dim;  // bytes per head block
+    // Padded to 8 + head_dim bytes (136 for head_dim=128) for cache line alignment
+    int bph = 8 + head_dim;  // 8-byte header (scale + 4 pad) + data
     int bpp = n_kv_heads * bph;
     unsigned char* out = dst + (size_t)pos * bpp + h * bph;
 
-    if (tid == 0) *(float*)(out) = scale;
+    if (tid == 0) {
+        *(float*)(out) = scale;
+        *(unsigned int*)(out + 4) = 0;  // padding
+    }
 
     for (int i = tid; i < head_dim; i += 32) {
         int q = __float2int_rn(head_src[i] * inv);
-        out[4 + i] = (unsigned char)(signed char)(q > 127 ? 127 : (q < -127 ? -127 : q));
+        out[8 + i] = (unsigned char)(signed char)(q > 127 ? 127 : (q < -127 ? -127 : q));
     }
 }
 "#;
 
-/// Attention with INT8 co-located KV. Minimal dequant: scale * (float)(int8).
-/// One block per head per position. Clean stride: bpp = n_kv_heads * (4 + head_dim).
+/// Attention with INT8 co-located KV. Deferred scale multiply, 4×32 unrolled inner loop.
+/// Q preloaded into shared memory. Scale applied ONCE per position, not per element.
 pub const ATTENTION_INT8C_KV_SRC: &str = r#"
 #include <hip/hip_runtime.h>
 
@@ -1928,62 +1931,66 @@ extern "C" __global__ void attention_int8c_kv(
     const int tid = threadIdx.x;
     const int nthreads = blockDim.x;
 
-    const float* q_head = q + h * head_dim;
-    const int bph = 4 + head_dim;
+    const int bph = 8 + head_dim;  // 8-byte header (scale + pad) + data
     const int bpp = n_kv_heads * bph;
 
     float* scores = sdata;
     float* ws = sdata + seq_len;
+    float* q_sh = ws + nthreads;
 
-    // Phase 1: QK dot product with int8 dequant
+    // Preload Q into shared memory
+    const float* q_head = q + h * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads)
+        q_sh[d] = q_head[d];
+    __syncthreads();
+
+    // Phase 1: QK with deferred scale, vector loads, 4-wide accumulation
     float lmax = -1e30f;
     for (int t = tid; t < seq_len; t += nthreads) {
         const unsigned char* blk = k_cache + (size_t)t * bpp + kv_h * bph;
         float sc = *(const float*)(blk);
-        float dot = 0.0f;
-        for (int d = 0; d < head_dim; d++)
-            dot += q_head[d] * (sc * (float)((signed char)blk[4 + d]));
-        float s = dot * scale_attn;
-        scores[t] = s;
-        lmax = fmaxf(lmax, s);
+        const signed char* kd = (const signed char*)(blk + 8);
+
+        // 4-wide unrolled dot product with deferred scale
+        float acc = 0.0f;
+        for (int j = 0; j < head_dim; j += 4) {
+            acc += q_sh[j]   * (float)kd[j]
+                 + q_sh[j+1] * (float)kd[j+1]
+                 + q_sh[j+2] * (float)kd[j+2]
+                 + q_sh[j+3] * (float)kd[j+3];
+        }
+        scores[t] = sc * acc * scale_attn;
+        lmax = fmaxf(lmax, scores[t]);
     }
 
     ws[tid] = lmax;
     __syncthreads();
-    for (int s = nthreads / 2; s > 0; s >>= 1) {
-        if (tid < s) ws[tid] = fmaxf(ws[tid], ws[tid + s]);
-        __syncthreads();
-    }
-    float max_val = ws[0];
-    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) { if (tid < s) ws[tid] = fmaxf(ws[tid], ws[tid + s]); __syncthreads(); }
+    float max_val = ws[0]; __syncthreads();
 
     float lsum = 0.0f;
+    for (int t = tid; t < seq_len; t += nthreads) { float e = expf(scores[t] - max_val); scores[t] = e; lsum += e; }
+    ws[tid] = lsum; __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) { if (tid < s) ws[tid] += ws[tid + s]; __syncthreads(); }
+    float sv = ws[0]; __syncthreads();
+    for (int t = tid; t < seq_len; t += nthreads) scores[t] /= sv;
+    __syncthreads();
+
+    // Phase 2: weighted V sum — precompute score*scale per position
+    // This avoids loading scale once per (position × dimension) — loads it once per position
+    float* sv_cache = ws;  // reuse workspace for score*scale products
     for (int t = tid; t < seq_len; t += nthreads) {
-        float e = expf(scores[t] - max_val);
-        scores[t] = e;
-        lsum += e;
+        const unsigned char* blk = v_cache + (size_t)t * bpp + kv_h * bph;
+        sv_cache[t] = scores[t] * *(const float*)(blk);
     }
-    ws[tid] = lsum;
-    __syncthreads();
-    for (int s = nthreads / 2; s > 0; s >>= 1) {
-        if (tid < s) ws[tid] += ws[tid + s];
-        __syncthreads();
-    }
-    float sum_val = ws[0];
     __syncthreads();
 
-    for (int t = tid; t < seq_len; t += nthreads)
-        scores[t] /= sum_val;
-    __syncthreads();
-
-    // Phase 2: weighted V sum
     float* out_head = out + h * head_dim;
     for (int d = tid; d < head_dim; d += nthreads) {
         float val = 0.0f;
         for (int t = 0; t < seq_len; t++) {
             const unsigned char* blk = v_cache + (size_t)t * bpp + kv_h * bph;
-            float sc = *(const float*)(blk);
-            val += scores[t] * (sc * (float)((signed char)blk[4 + d]));
+            val += sv_cache[t] * (float)((signed char)blk[8 + d]);
         }
         out_head[d] = val;
     }
