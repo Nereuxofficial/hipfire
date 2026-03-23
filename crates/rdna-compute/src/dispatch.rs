@@ -2115,6 +2115,29 @@ impl Gpu {
 
     // ── DeltaNet ops (feature-gated) ─────────────────────────────────────
 
+    /// Partial interleaved RoPE for Qwen3.5 full attention layers.
+    #[cfg(feature = "deltanet")]
+    pub fn rope_partial_interleaved_f32(
+        &mut self, q: &GpuTensor, k: &GpuTensor, pos: i32,
+        n_heads_q: usize, n_heads_k: usize, head_dim: usize, n_rot: usize, freq_base: f32,
+    ) -> HipResult<()> {
+        self.ensure_kernel("rope_partial_interleaved", kernels::ROPE_PARTIAL_INTERLEAVED_SRC, "rope_partial_interleaved_f32")?;
+        let func = &self.functions["rope_partial_interleaved_f32"];
+        let mut qp = q.buf.as_ptr(); let mut kp = k.buf.as_ptr();
+        let mut p = pos; let mut nhq = n_heads_q as i32; let mut nhk = n_heads_k as i32;
+        let mut hd = head_dim as i32; let mut nr = n_rot as i32; let mut fb = freq_base;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void, &mut kp as *mut _ as *mut c_void,
+            &mut p as *mut _ as *mut c_void, &mut nhq as *mut _ as *mut c_void,
+            &mut nhk as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void, &mut fb as *mut _ as *mut c_void,
+        ];
+        let n_pairs = (n_rot / 2) as u32;
+        let block = 32u32.min(n_pairs);
+        let grid = (n_pairs + block - 1) / block;
+        unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
     /// Sigmoid activation, in-place.
     #[cfg(feature = "deltanet")]
     pub fn sigmoid_f32(&mut self, x: &GpuTensor) -> HipResult<()> {

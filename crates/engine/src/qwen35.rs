@@ -522,10 +522,10 @@ pub fn forward(
                 // K norm
                 gpu.rmsnorm_batched(&k, &layer.k_norm, &k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
 
-                // RoPE (partial — only first partial_rotary_factor * head_dim dims)
-                // For now: apply RoPE to full Q and K (partial RoPE needs a new kernel)
-                // TODO: implement partial RoPE
-                gpu.rope_f32(&q, &k, &pos_buf, config.n_heads, config.n_kv_heads, config.head_dim, config.rope_theta)?;
+                // Partial interleaved RoPE: rotate first n_rot dims, pairs (d0,d1),(d2,d3),...
+                let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize; // 64
+                gpu.rope_partial_interleaved_f32(&q, &k, pos as i32,
+                    config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
 
                 // KV cache write + attention
                 gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, kv_dim)?;
