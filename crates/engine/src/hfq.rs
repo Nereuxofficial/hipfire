@@ -10,13 +10,13 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
-struct HfqTensorInfo {
-    name: String,
-    quant_type: u8, // 0=Q4F16G64, 1=F16, 2=F32
-    shape: Vec<u32>,
-    group_size: u32,
-    data_offset: usize, // offset from file start
-    data_size: usize,
+pub struct HfqTensorInfo {
+    pub name: String,
+    pub quant_type: u8, // 0=Q4F16G64, 1=F16, 2=F32
+    pub shape: Vec<u32>,
+    pub group_size: u32,
+    pub data_offset: usize,
+    pub data_size: usize,
 }
 
 pub struct HfqFile {
@@ -131,7 +131,7 @@ impl HfqFile {
         Ok(Self { _file: file, mmap, arch_id, metadata_json, tensors, tensor_map })
     }
 
-    fn tensor_data(&self, name: &str) -> Option<(&HfqTensorInfo, &[u8])> {
+    pub fn tensor_data(&self, name: &str) -> Option<(&HfqTensorInfo, &[u8])> {
         let idx = *self.tensor_map.get(name)?;
         let info = &self.tensors[idx];
         Some((info, &self.mmap[info.data_offset..info.data_offset + info.data_size]))

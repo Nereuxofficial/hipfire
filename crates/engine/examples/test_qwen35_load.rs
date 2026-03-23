@@ -70,4 +70,22 @@ fn main() {
     }
 
     eprintln!("\nConfig parse: OK");
+
+    // Test full weight loading
+    #[cfg(feature = "deltanet")]
+    {
+        use engine::qwen35;
+        let q35_config = qwen35::config_from_hfq(&hfq).expect("failed to parse Qwen3.5 config");
+        eprintln!("\nLoading Qwen3.5 weights...");
+        let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
+        let weights = qwen35::load_weights(&hfq, &q35_config, &mut gpu).expect("failed to load weights");
+        eprintln!("Loaded {} layers", weights.layers.len());
+        for (i, layer) in weights.layers.iter().enumerate() {
+            match layer {
+                qwen35::LayerWeights::DeltaNet(_) => eprint!("D"),
+                qwen35::LayerWeights::FullAttn(_) => eprint!("F"),
+            }
+        }
+        eprintln!("\nWeight loading: OK");
+    }
 }
