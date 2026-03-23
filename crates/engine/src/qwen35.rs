@@ -376,7 +376,13 @@ pub fn forward(
     let pos_i32 = pos as i32;
     gpu.hip.memcpy_htod(&pos_buf, &pos_i32.to_ne_bytes())?;
 
-    let mut delta_layer_idx = 0usize; // tracks which DeltaNet layer we're on
+    let mut delta_layer_idx = 0usize;
+
+    // Debug: embedding output
+    if pos == 19 {
+        let hid = gpu.download_f32(&x)?;
+        eprintln!("EMB: {:?}", &hid[..8].iter().map(|v| format!("{v:.6}")).collect::<Vec<_>>());
+    }
 
     for layer_idx in 0..config.n_layers {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
@@ -447,6 +453,17 @@ pub fn forward(
                 gpu.l2_norm_f32(&q_part, config.linear_num_key_heads, config.linear_key_head_dim, config.norm_eps)?;
                 gpu.l2_norm_f32(&k_part, config.linear_num_key_heads, config.linear_key_head_dim, config.norm_eps)?;
 
+                // Scale Q by 1/sqrt(S_k) before recurrence (matches llama.cpp)
+                {
+                    let mut q_cpu = gpu.download_f32(&q_part)?;
+                    let scale = 1.0 / (config.linear_key_head_dim as f32).sqrt();
+                    for v in &mut q_cpu { *v *= scale; }
+                    let q_bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(q_cpu.as_ptr() as *const u8, q_cpu.len() * 4)
+                    };
+                    gpu.hip.memcpy_htod(&q_part.buf, q_bytes)?;
+                }
+
                 // Gated Delta Net recurrence
                 let attn_out = gpu.alloc_tensor(&[v_dim], DType::F32)?;
                 gpu.gated_delta_net_f32(
@@ -454,6 +471,10 @@ pub fn forward(
                     &dn_state.s_matrices[delta_layer_idx], &attn_out,
                     1, n_v_heads, config.linear_value_head_dim,
                 )?;
+
+                // Note: llama.cpp also scales output by 1/sqrt(S_v) in the kernel
+                // but that combined with Q scaling gives 1/128 total which may be too much
+                // Testing Q-only scaling first
 
                 // Gated norm: rmsnorm(attn_out) * silu(z)
                 let normed_out = gpu.alloc_tensor(&[v_dim], DType::F32)?;
@@ -568,12 +589,11 @@ pub fn forward(
             _ => panic!("layer type mismatch at layer {layer_idx}"),
         }
 
-        // Per-layer norm tracking (last prompt token only)
+        // Per-layer hidden state dump (last prompt token only)
         if pos == 19 {
             let hid = gpu.download_f32(&x)?;
-            let norm: f32 = hid.iter().map(|v| v * v).sum::<f32>().sqrt();
             let lt = match config.layer_types[layer_idx] { LayerType::LinearAttention => "D", LayerType::FullAttention => "F" };
-            eprintln!("  L{layer_idx:>2}({lt}) norm={norm:.2}");
+            eprintln!("L{layer_idx:02}({lt}): {:?}", &hid[..8].iter().map(|v| format!("{v:.6}")).collect::<Vec<_>>());
         }
     }
 
