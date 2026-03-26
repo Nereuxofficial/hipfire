@@ -858,7 +858,14 @@ fn main() {
             let this_q4as8 = use_fast && !this_q8; // FFN tensors in q8-fast mode
             let this_q4k = use_q4k_all || use_q4k_q8embed || use_mixed;
 
-            let (quantized, qt, gs, label) = if use_hfq4g256 {
+            // Embeddings stored as Q8 in HFQ4 mode — Q4 is too lossy for
+            // large-dim models (9B: dim=4096, values ~0.016, Q4 step ~0.007)
+            let is_embed = name.contains("embed_tokens");
+
+            let (quantized, qt, gs, label) = if use_hfq4g256 && is_embed {
+                let q = quantize_q8f16(&f32_data);
+                (q, QuantType::Q8F16, 32u32, "Q8_F16")
+            } else if use_hfq4g256 {
                 // Auto-select G128 vs G256 based on K dimension
                 // G256 preferred: better coalescing, fewer scale/zero overheads
                 // G128 only as fallback when K isn't divisible by 256
@@ -888,13 +895,15 @@ fn main() {
                 (q, QuantType::Q4F16G64, 64u32, "Q4_F16")
             };
 
-            // Compute quantization error
+            // Compute quantization error (skip for Q8 embeddings — always negligible)
             let block_size = gs as usize;
-            let n_blocks = (n_elements + block_size - 1) / block_size;
+            let is_hfq4 = label == "HFQ4G256" || label == "HFQ4G128";
+            let skip_error = is_embed && !is_hfq4;
+            let n_blocks = if !skip_error { (n_elements + block_size - 1) / block_size } else { 0 };
             for b in 0..n_blocks {
                 let start = b * block_size;
                 let end = (start + block_size).min(n_elements);
-                if use_hfq4g256 {
+                if is_hfq4 {
                     // Both G128 (72B) and G256 (136B): [f32 scale][f32 zero][nibbles]
                     let block_bytes = if block_size == 256 { 136 } else { 72 };
                     let off = b * block_bytes;

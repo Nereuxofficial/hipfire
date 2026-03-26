@@ -301,6 +301,10 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
     } else if embd_info.0.quant_type == 7 {
         eprintln!("    (HFQ4-G128 raw, {} MB)", embd_info.1.len() / 1_000_000);
         (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::HFQ4G128)
+    } else if embd_info.0.quant_type == 3 {
+        // Q8_0: [f16 scale][32 × int8] per block — upload raw, use Q8 embedding lookup
+        eprintln!("    (Q8_0 raw, {} MB)", embd_info.1.len() / 1_000_000);
+        (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::Q8_0)
     } else {
         let f32_data: Vec<f32> = embd_info.1.chunks_exact(2)
             .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
@@ -318,6 +322,10 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
         let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
         let dtype = if embd_info.0.quant_type == 6 { DType::HFQ4G256 } else { DType::HFQ4G128 };
         WeightTensor { buf, gpu_dtype: dtype, m: config.vocab_size, k: config.dim, row_stride: 0 }
+    } else if embd_info.0.quant_type == 3 {
+        // Q8_0 embedding — also used for output GEMV
+        let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
+        WeightTensor { buf, gpu_dtype: DType::Q8_0, m: config.vocab_size, k: config.dim, row_stride: 0 }
     } else {
         let f32_data: Vec<f32> = embd_data.chunks_exact(2)
             .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
@@ -405,6 +413,7 @@ pub fn forward(
     match weights.embd_format {
         EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &x, token, dim)?,
         EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &x, token, dim)?,
+        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x, token, dim)?,
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x, token, dim)?,
         _ => panic!("unsupported embedding format"),
     }
@@ -415,6 +424,13 @@ pub fn forward(
     gpu.hip.memcpy_htod(&pos_buf, &pos_i32.to_ne_bytes())?;
 
     let mut delta_layer_idx = 0usize;
+    let debug_layers = std::env::var("DEBUG_LAYERS").is_ok();
+
+    if debug_layers && pos == 0 {
+        let hid = gpu.download_f32(&x)?;
+        let norm: f32 = hid.iter().map(|v| v * v).sum::<f32>().sqrt();
+        eprintln!("EMB: first4=[{:.6},{:.6},{:.6},{:.6}] norm={norm:.4}", hid[0], hid[1], hid[2], hid[3]);
+    }
 
     for layer_idx in 0..config.n_layers {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
@@ -633,6 +649,12 @@ pub fn forward(
             _ => panic!("layer type mismatch at layer {layer_idx}"),
         }
 
+        if debug_layers && pos == 0 {
+            let hid = gpu.download_f32(&x)?;
+            let norm: f32 = hid.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let lt = match config.layer_types[layer_idx] { LayerType::LinearAttention => "D", LayerType::FullAttention => "F" };
+            eprintln!("L{layer_idx:02}({lt}): first4=[{:.4},{:.4},{:.4},{:.4}] norm={norm:.2}", hid[0], hid[1], hid[2], hid[3]);
+        }
     }
 
     // Final norm + output projection
