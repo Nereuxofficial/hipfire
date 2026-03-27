@@ -1328,23 +1328,39 @@ pub fn forward(
         // RoPE — GPU-side, reads pos from GPU buffer
         gpu.rope_f32(&q, &k, &pos_buf, n_heads, n_kv_heads, head_dim, config.rope_freq_base)?;
 
-        // Store K, V in GPU cache — GPU-side copy using pos from GPU buffer
-        gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, kv_dim)?;
-        gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, kv_dim)?;
-
-        // GPU-side attention
-        gpu.attention_f32(
-            &q,
-            &kv_cache.k_gpu[layer_idx],
-            &kv_cache.v_gpu[layer_idx],
-            &attn_out,
-            &pos_buf,
-            pos + 1,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            kv_cache.max_seq,
-        )?;
+        // Store K, V in GPU cache + attention
+        if kv_cache.quant_turbo > 0 {
+            let s1 = kv_cache.turbo_signs1.as_ref().unwrap();
+            let s2 = kv_cache.turbo_signs2.as_ref().unwrap();
+            match kv_cache.quant_turbo {
+                4 => {
+                    gpu.kv_cache_write_turbo4(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, s1, s2, n_kv_heads, head_dim)?;
+                    gpu.kv_cache_write_turbo4(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, s1, s2, n_kv_heads, head_dim)?;
+                    gpu.attention_turbo4_kv(&q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &attn_out, &pos_buf, s1, s2, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq)?;
+                }
+                3 => {
+                    gpu.kv_cache_write_turbo3(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, s1, s2, n_kv_heads, head_dim)?;
+                    gpu.kv_cache_write_turbo3(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, s1, s2, n_kv_heads, head_dim)?;
+                    gpu.attention_turbo3_kv(&q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &attn_out, &pos_buf, s1, s2, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq)?;
+                }
+                2 => {
+                    gpu.kv_cache_write_turbo2(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, s1, s2, n_kv_heads, head_dim)?;
+                    gpu.kv_cache_write_turbo2(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, s1, s2, n_kv_heads, head_dim)?;
+                    gpu.attention_turbo2_kv(&q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &attn_out, &pos_buf, s1, s2, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq)?;
+                }
+                _ => panic!("unsupported turbo bits"),
+            }
+        } else {
+            gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, kv_dim)?;
+            gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, kv_dim)?;
+            gpu.attention_f32(
+                &q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &attn_out, &pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+            )?;
+        }
         // Output projection: o = Wo * attn_out
         weight_gemv(gpu, &layer.wo, &attn_out, &o)?;
 

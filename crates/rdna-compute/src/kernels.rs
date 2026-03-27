@@ -4345,12 +4345,12 @@ extern "C" __global__ void argmax_f32(
 pub const TURBO_COMMON_SRC: &str = r#"
 #include <hip/hip_runtime.h>
 
-// Lloyd-Max optimal centroids for N(0,1) — scaled by corrected_norm at runtime
-__constant__ float TURBO_C2[4] = {-1.510f, -0.4528f, 0.4528f, 1.510f};
-__constant__ float TURBO_C3[8] = {-2.152f, -1.344f, -0.756f, -0.245f, 0.245f, 0.756f, 1.344f, 2.152f};
+// Lloyd-Max optimal centroids for N(0, 1/128) after unit-norm + FWHT(1/sqrt(128))
+__constant__ float TURBO_C2[4] = {-0.133466f, -0.040022f, 0.040022f, 0.133466f};
+__constant__ float TURBO_C3[8] = {-0.190685f, -0.117832f, -0.065717f, -0.021460f, 0.021460f, 0.065717f, 0.117832f, 0.190685f};
 __constant__ float TURBO_C4[16] = {
-    -2.733f, -2.069f, -1.618f, -1.256f, -0.942f, -0.656f, -0.388f, -0.127f,
-     0.127f,  0.388f,  0.656f,  0.942f,  1.256f,  1.618f,  2.069f,  2.733f
+    -0.241565f, -0.182875f, -0.143012f, -0.111016f, -0.083262f, -0.057983f, -0.034295f, -0.011225f,
+     0.011225f,  0.034295f,  0.057983f,  0.083262f,  0.111016f,  0.143012f,  0.182875f,  0.241565f
 };
 
 // In-place FWHT on 128 elements in registers.
@@ -4400,24 +4400,23 @@ __device__ void fwht_inverse_128(float* x,
     for (int i = 0; i < 128; i++) x[i] *= inv_sqrt_128 * signs1[i];
 }
 
-// Branchless 2-bit quantize: returns index 0-3
+// Branchless 2-bit quantize: returns index 0-3 (thresholds for N(0, 1/128))
 __device__ int turbo_quantize_2bit(float x) {
-    // Thresholds: -0.9814, 0.0, 0.9814
-    return (x > -0.9814f) + (x > 0.0f) + (x > 0.9814f);
+    return (x > -0.086744f) + (x > 0.0f) + (x > 0.086744f);
 }
 
 // Branchless 3-bit quantize: returns index 0-7
 __device__ int turbo_quantize_3bit(float x) {
-    return (x > -1.748f) + (x > -1.050f) + (x > -0.5005f) + (x > 0.0f)
-         + (x > 0.5005f) + (x > 1.050f) + (x > 1.748f);
+    return (x > -0.154258f) + (x > -0.091775f) + (x > -0.043589f) + (x > 0.0f)
+         + (x > 0.043589f) + (x > 0.091775f) + (x > 0.154258f);
 }
 
 // Branchless 4-bit quantize: returns index 0-15
 __device__ int turbo_quantize_4bit(float x) {
-    return (x > -2.401f) + (x > -1.8435f) + (x > -1.437f) + (x > -1.099f)
-         + (x > -0.799f) + (x > -0.522f) + (x > -0.2575f) + (x > 0.0f)
-         + (x > 0.2575f) + (x > 0.522f) + (x > 0.799f) + (x > 1.099f)
-         + (x > 1.437f) + (x > 1.8435f) + (x > 2.401f);
+    return (x > -0.212220f) + (x > -0.162944f) + (x > -0.127014f) + (x > -0.097139f)
+         + (x > -0.070622f) + (x > -0.046139f) + (x > -0.022760f) + (x > 0.0f)
+         + (x > 0.022760f) + (x > 0.046139f) + (x > 0.070622f) + (x > 0.097139f)
+         + (x > 0.127014f) + (x > 0.162944f) + (x > 0.212220f);
 }
 "#;
 
@@ -4843,7 +4842,7 @@ extern "C" __global__ void attention_turbo3_kv(
         }
     }
 
-    float* shared_out = workspace;
+    // Reduce V partial sums across threads, store directly in q_rotated
     for (int d = 0; d < head_dim; d++) {
         workspace[tid] = out_rotated[d];
         __syncthreads();
@@ -4851,13 +4850,9 @@ extern "C" __global__ void attention_turbo3_kv(
             if (tid < s) workspace[tid] += workspace[tid + s];
             __syncthreads();
         }
-        if (tid == 0) shared_out[d] = workspace[0];
+        if (tid == 0) q_rotated[d] = workspace[0];
         __syncthreads();
     }
-
-    for (int d = tid; d < head_dim; d += nthreads)
-        q_rotated[d] = shared_out[d];
-    __syncthreads();
     if (tid == 0) fwht_inverse_128(q_rotated, signs1, signs2);
     __syncthreads();
 
@@ -4975,7 +4970,7 @@ extern "C" __global__ void attention_turbo2_kv(
         }
     }
 
-    float* shared_out = workspace;
+    // Reduce V partial sums across threads, store directly in q_rotated
     for (int d = 0; d < head_dim; d++) {
         workspace[tid] = out_rotated[d];
         __syncthreads();
@@ -4983,13 +4978,9 @@ extern "C" __global__ void attention_turbo2_kv(
             if (tid < s) workspace[tid] += workspace[tid + s];
             __syncthreads();
         }
-        if (tid == 0) shared_out[d] = workspace[0];
+        if (tid == 0) q_rotated[d] = workspace[0];
         __syncthreads();
     }
-
-    for (int d = tid; d < head_dim; d += nthreads)
-        q_rotated[d] = shared_out[d];
-    __syncthreads();
     if (tid == 0) fwht_inverse_128(q_rotated, signs1, signs2);
     __syncthreads();
 

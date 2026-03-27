@@ -1,53 +1,31 @@
 //! Run inference on a .hfq (hipfire-quantized) model.
-//! Usage: cargo run --release --example infer_hfq <model.hfq> [--temp T] [--debug] [prompt text...]
+//! Usage: cargo run --release --example infer_hfq <model.hfq> [prompt text...]
 
 use engine::hfq::{self, HfqFile};
 use engine::llama::{self, KvCache};
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-static RUNNING: AtomicBool = AtomicBool::new(true);
-extern "C" fn handle_sigint(_: libc::c_int) { RUNNING.store(false, Ordering::SeqCst); }
-
 fn main() {
-    unsafe { libc::signal(libc::SIGINT, handle_sigint as libc::sighandler_t); }
     let args: Vec<String> = std::env::args().collect();
     let model_path = args.get(1)
-        .unwrap_or_else(|| { eprintln!("Usage: infer_hfq <model.hfq> [--temp T] [--debug] [prompt...]"); std::process::exit(1); });
+        .unwrap_or_else(|| { eprintln!("Usage: infer_hfq <model.hfq> [prompt...]"); std::process::exit(1); });
 
-    // Parse flags
-    let temp: f32 = args.iter().position(|a| a == "--temp")
-        .map(|i| args[i + 1].parse().unwrap_or(0.6))
-        .unwrap_or(0.6);
-    let debug = args.iter().any(|a| a == "--debug");
-    let top_p: f32 = if temp == 0.0 { 1.0 } else { 0.8 };
-    let repeat_penalty: f32 = args.iter().position(|a| a == "--repeat-penalty")
-        .map(|i| args[i + 1].parse().unwrap_or(1.1)).unwrap_or(1.1);
-    let repeat_window: usize = args.iter().position(|a| a == "--repeat-window")
-        .map(|i| args[i + 1].parse().unwrap_or(64)).unwrap_or(64);
-    let use_q4kv = args.iter().any(|a| a == "--q4kv");
-    let use_q8kv = args.iter().any(|a| a == "--q8kv");
-    let use_int8kv = args.iter().any(|a| a == "--int8kv");
+    // Parse --turbo flag
+    let turbo_bits: u8 = args.iter().find(|a| a.starts_with("--turbo"))
+        .map(|a| a.trim_start_matches("--turbo").parse().unwrap_or(3))
+        .unwrap_or(0);
 
-    // Collect prompt text (skip flags)
-    let mut prompt_parts = Vec::new();
-    let mut skip_next = false;
-    for (_i, a) in args.iter().enumerate().skip(2) {
-        if skip_next { skip_next = false; continue; }
-        if a == "--temp" || a == "--debug" || a == "--q4kv" || a == "--q8kv" || a == "--int8kv" || a == "--int8ckv" || a == "--hfq4kv" || a == "--fp32kv" || a == "--repeat-penalty" || a == "--repeat-window" {
-            if a == "--temp" || a == "--repeat-penalty" || a == "--repeat-window" { skip_next = true; }
-            continue;
-        }
-        prompt_parts.push(a.as_str());
-    }
-    let prompt_text = if prompt_parts.is_empty() { "Hello".to_string() } else { prompt_parts.join(" ") };
+    let prompt_text = {
+        let parts: Vec<&str> = args[2..].iter()
+            .filter(|a| !a.starts_with("--turbo"))
+            .map(|s| s.as_str()).collect();
+        if parts.is_empty() { "Hello".to_string() } else { parts.join(" ") }
+    };
 
     eprintln!("=== hipfire inference engine (HFQ) ===");
     eprintln!("Model: {model_path}");
-    if temp == 0.0 { eprintln!("Sampling: GREEDY (temp=0)"); }
-    else { eprintln!("Sampling: temp={temp}, top_p={top_p}"); }
 
     // Parse HFQ
     let hfq = HfqFile::open(Path::new(model_path)).expect("failed to parse HFQ");
@@ -55,32 +33,28 @@ fn main() {
     eprintln!("Config: dim={}, layers={}, heads={}, kv_heads={}, vocab={}",
         config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.vocab_size);
 
-    // Load tokenizer from HFQ metadata (embedded tokenizer.json)
-    let tokenizer = engine::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-        .expect("no tokenizer in HFQ file — requantize with tokenizer.json in the model directory");
-    eprintln!("Tokenizer: {} tokens (from HFQ)", tokenizer.vocab_size());
+    // Load tokenizer from a matching GGUF (fallback until tokenizer is embedded in HFQ)
+    let gguf_path = if config.arch == llama::ModelArch::Qwen3 {
+        "/home/kaden/llama.cpp/models/Qwen3-0.6B-Q8_0.gguf"
+    } else {
+        "/home/kaden/llama.cpp/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
+    };
+    let gguf = engine::gguf::GgufFile::open(Path::new(gguf_path)).expect("need GGUF for tokenizer");
+    let tokenizer = engine::tokenizer::Tokenizer::from_gguf(&gguf).expect("failed to load tokenizer");
+    eprintln!("Tokenizer: {} tokens (from GGUF: {})", tokenizer.vocab_size(),
+        std::path::Path::new(gguf_path).file_name().unwrap().to_str().unwrap());
 
     let mut prompt_tokens = tokenizer.encode(&prompt_text);
 
-    // ChatML template: auto-detect from tokenizer (works for Qwen3, Qwen3.5, etc.)
-    let has_chatml = tokenizer.encode("<|im_start|>").len() == 1
-        && tokenizer.encode("<|im_end|>").len() == 1;
-    if has_chatml {
+    // Qwen3 chat template: <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
+    if config.arch == llama::ModelArch::Qwen3 {
         let im_start = tokenizer.encode("<|im_start|>");
         let im_end = tokenizer.encode("<|im_end|>");
         let user_tok = tokenizer.encode("user");
         let asst_tok = tokenizer.encode("assistant");
         let nl_tok = tokenizer.encode("\n");
-        let sys_tok = tokenizer.encode("system");
-        let sys_msg = tokenizer.encode("You are a helpful assistant.");
 
         let mut chat = Vec::new();
-        chat.extend_from_slice(&im_start);
-        chat.extend_from_slice(&sys_tok);
-        chat.extend_from_slice(&nl_tok);
-        chat.extend_from_slice(&sys_msg);
-        chat.extend_from_slice(&im_end);
-        chat.extend_from_slice(&nl_tok);
         chat.extend_from_slice(&im_start);
         chat.extend_from_slice(&user_tok);
         chat.extend_from_slice(&nl_tok);
@@ -106,64 +80,33 @@ fn main() {
 
     // KV cache
     let kv_seq_len = config.max_seq_len.min(2048);
-    let use_fp32kv = args.iter().any(|a| a == "--fp32kv");
-    let use_hfq4kv = args.iter().any(|a| a == "--hfq4kv");
-    let use_int8ckv = args.iter().any(|a| a == "--int8ckv");
-    let mut kv_cache = if use_int8ckv {
-        eprintln!("KV cache: INT8 co-located symmetric (132 bytes/head)");
-        KvCache::new_gpu_int8c(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
-    } else if use_hfq4kv {
-        eprintln!("KV cache: HFQ4 co-located blocks (3.56x compression)");
-        KvCache::new_gpu_hfq4kv(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
-    } else if use_fp32kv {
-        eprintln!("KV cache: FP32 (unquantized)");
-        KvCache::new_gpu(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
+    let mut kv_cache = if turbo_bits > 0 {
+        KvCache::new_gpu_turbo(
+            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len, turbo_bits,
+        ).unwrap()
     } else {
-        // Default: Q8_0 quantized KV cache (3.76x smaller, +7% gen speed)
-        KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
+        KvCache::new_gpu(
+            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len,
+        ).unwrap()
     };
 
-    // Persistent scratch buffers
-    let scratch = llama::ForwardScratch::new(&mut gpu, &config).unwrap();
-    let mut rng_state = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos();
-    if rng_state == 0 { rng_state = 1; }
-
-    let mut token_history: Vec<u32> = prompt_tokens.clone();
-
-    // Process prompt: try batched prefill, fall back to sequential
+    // Process prompt
     let t1 = Instant::now();
-    let prefill_logits = llama::prefill_forward(
-        &mut gpu, &weights, &config, &prompt_tokens, &mut kv_cache,
-    );
-    let mut next_token = if let Ok(logits) = prefill_logits {
-        let prompt_ms = t1.elapsed().as_millis();
-        eprintln!("Prompt: {}ms ({} tokens, {:.0} tok/s) [batched]",
-            prompt_ms, prompt_tokens.len(),
-            prompt_tokens.len() as f64 / (prompt_ms as f64 / 1000.0));
-        llama::argmax(&logits)
-    } else {
-        // Fallback: sequential token-at-a-time prefill
-        for (pos, &token) in prompt_tokens.iter().enumerate() {
-            let (_, rng) = llama::forward_scratch(
-                &mut gpu, &weights, &config, token, pos, &mut kv_cache,
-                &scratch, temp.max(0.01), top_p, rng_state, 0, 1.0,
-            ).expect("forward_scratch failed");
-            rng_state = rng;
-        }
-        let prompt_ms = t1.elapsed().as_millis();
-        eprintln!("Prompt: {}ms ({} tokens, {:.0} tok/s) [sequential]",
-            prompt_ms, prompt_tokens.len(),
-            prompt_tokens.len() as f64 / (prompt_ms as f64 / 1000.0));
-        let mut out_bytes = [0u8; 8];
-        gpu.hip.memcpy_dtoh(&mut out_bytes, &scratch.sample_buf.buf).unwrap();
-        u32::from_ne_bytes([out_bytes[0], out_bytes[1], out_bytes[2], out_bytes[3]])
-    };
+    let mut logits = Vec::new();
+    for (pos, &token) in prompt_tokens.iter().enumerate() {
+        logits = llama::forward(&mut gpu, &weights, &config, token, pos, &mut kv_cache)
+            .expect("forward pass failed");
+    }
+    let prompt_ms = t1.elapsed().as_millis();
+    eprintln!("Prompt: {}ms ({} tokens, {:.0} tok/s)",
+        prompt_ms, prompt_tokens.len(),
+        prompt_tokens.len() as f64 / (prompt_ms as f64 / 1000.0));
 
     // Generate
-    let max_gen = 2048;
+    let max_gen = 128;
     eprintln!("\nGenerating (max {max_gen} tokens)...\n");
     let t2 = Instant::now();
+    let mut next_token = llama::argmax(&logits);
     let mut generated = Vec::new();
 
     for _ in 0..max_gen {
@@ -172,31 +115,14 @@ fn main() {
         print!("{text}");
         std::io::stdout().flush().ok();
 
-        if debug && (generated.len() % 50 == 0 || generated.len() <= 5) {
-            let pos = prompt_tokens.len() + generated.len() - 1;
-            eprintln!("[DEBUG] gen={}, pos={}, token_id={}, text={:?}",
-                generated.len(), pos, next_token, text);
-        }
-
-        if next_token == config.eos_token || !RUNNING.load(Ordering::Relaxed) {
+        if next_token == config.eos_token {
             break;
         }
 
-        // Upload recent token history for repetition penalty
-        token_history.push(next_token);
-        let hist_start = token_history.len().saturating_sub(repeat_window);
-        let hist_slice = &token_history[hist_start..];
-        let hist_bytes: Vec<u8> = hist_slice.iter().flat_map(|t| t.to_ne_bytes()).collect();
-        gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &hist_bytes).unwrap();
-
         let pos = prompt_tokens.len() + generated.len() - 1;
-        let (tok, rng) = llama::forward_scratch(
-            &mut gpu, &weights, &config, next_token, pos, &mut kv_cache,
-            &scratch, temp.max(0.01), top_p, rng_state,
-            hist_slice.len(), repeat_penalty,
-        ).expect("forward_scratch failed");
-        next_token = tok;
-        rng_state = rng;
+        logits = llama::forward(&mut gpu, &weights, &config, next_token, pos, &mut kv_cache)
+            .expect("forward pass failed");
+        next_token = llama::argmax(&logits);
     }
 
     let gen_ms = t2.elapsed().as_millis();
