@@ -4587,6 +4587,68 @@ __device__ void fwht_inverse_128(float* x,
     for (int i = 0; i < 128; i++) x[i] *= inv_sqrt_128 * signs1[i];
 }
 
+
+// Register-only FWHT via __shfl_xor. Zero shared memory. Zero barriers.
+// Each thread owns 4 of 128 elements in registers (a,b,c,d).
+// signs1/signs2 are applied from constant memory.
+// After this function, (a,b,c,d) are in the FWHT-rotated space.
+__device__ void fwht_shfl_forward(float& a, float& b, float& c, float& d,
+    const float* __restrict__ signs1, const float* __restrict__ signs2, int tid)
+{
+    int d0 = tid * 4;
+    // Apply signs1
+    a *= signs1[d0]; b *= signs1[d0+1]; c *= signs1[d0+2]; d *= signs1[d0+3];
+
+    // Local butterfly: stride 1 (pairs 0↔1, 2↔3)
+    float t;
+    t = a; a = a + b; b = t - b;
+    t = c; c = c + d; d = t - d;
+
+    // Local butterfly: stride 2 (pairs 0↔2, 1↔3)
+    t = a; a = a + c; c = t - c;
+    t = b; b = b + d; d = t - d;
+
+    // Wave-level butterfly: strides 4,8,16,32,64 → thread strides 1,2,4,8,16
+    for (int ts = 1; ts <= 16; ts <<= 1) {
+        float pa = __shfl_xor(a, ts);
+        float pb = __shfl_xor(b, ts);
+        float pc = __shfl_xor(c, ts);
+        float pd = __shfl_xor(d, ts);
+        if (tid & ts) { a = pa - a; b = pb - b; c = pc - c; d = pd - d; }
+        else          { a = a + pa; b = b + pb; c = c + pc; d = d + pd; }
+    }
+
+    // Scale by 1/sqrt(128) and apply signs2
+    const float s = 0.08838834764831845f;
+    a *= s * signs2[d0]; b *= s * signs2[d0+1]; c *= s * signs2[d0+2]; d *= s * signs2[d0+3];
+}
+
+// Inverse: signs2, butterfly, scale, signs1 (reverse order)
+__device__ void fwht_shfl_inverse(float& a, float& b, float& c, float& d,
+    const float* __restrict__ signs1, const float* __restrict__ signs2, int tid)
+{
+    int d0 = tid * 4;
+    a *= signs2[d0]; b *= signs2[d0+1]; c *= signs2[d0+2]; d *= signs2[d0+3];
+
+    for (int ts = 1; ts <= 16; ts <<= 1) {
+        float pa = __shfl_xor(a, ts);
+        float pb = __shfl_xor(b, ts);
+        float pc = __shfl_xor(c, ts);
+        float pd = __shfl_xor(d, ts);
+        if (tid & ts) { a = pa - a; b = pb - b; c = pc - c; d = pd - d; }
+        else          { a = a + pa; b = b + pb; c = c + pc; d = d + pd; }
+    }
+
+    float t;
+    t = a; a = a + c; c = t - c;
+    t = b; b = b + d; d = t - d;
+    t = a; a = a + b; b = t - b;
+    t = c; c = c + d; d = t - d;
+
+    const float s = 0.08838834764831845f;
+    a *= s * signs1[d0]; b *= s * signs1[d0+1]; c *= s * signs1[d0+2]; d *= s * signs1[d0+3];
+}
+
 // Branchless 2-bit quantize: returns index 0-3 (thresholds for N(0, 1/128))
 __device__ int turbo_quantize_2bit(float x) {
     return (x > -0.086744f) + (x > 0.0f) + (x > 0.086744f);
@@ -4901,34 +4963,18 @@ extern "C" __global__ void kv_cache_write_turbo2(
         for (int d = tid; d < head_dim; d += nthreads) x[d] *= inv_norm;
         __syncthreads();
 
-        // Parallel FWHT
-        for (int d = tid; d < head_dim; d += nthreads) x[d] *= signs1[d];
-        __syncthreads();
-        for (int stride = 1; stride <= 2; stride <<= 1) {
-            for (int base = tid; base < head_dim / 2; base += nthreads) {
-                int blk = base / stride, j = base % stride, i = blk * stride * 2 + j;
-                float a = x[i], b = x[i + stride]; x[i] = a + b; x[i + stride] = a - b;
-            }
-        }
-        __syncthreads();
-        for (int stride = 4; stride < head_dim; stride <<= 1) {
-            for (int base = tid; base < head_dim / 2; base += nthreads) {
-                int blk = base / stride, j = base % stride, i = blk * stride * 2 + j;
-                float a = x[i], b = x[i + stride]; x[i] = a + b; x[i + stride] = a - b;
-            }
-            __syncthreads();
-        }
-        const float inv_sqrt = 0.08838834764831845f;
-        for (int d = tid; d < head_dim; d += nthreads) x[d] *= inv_sqrt * signs2[d];
-        __syncthreads();
-
-        // 2-bit quantize (each thread handles 4 dims)
+        // Register-only FWHT via __shfl_xor (zero shared memory barriers)
         const int dpt = head_dim / nthreads;
         const int d0 = tid * dpt;
+        float fa = x[d0], fb = x[d0+1], fc = x[d0+2], fd = x[d0+3];
+        fwht_shfl_forward(fa, fb, fc, fd, signs1, signs2, tid);
+
+        // 2-bit quantize from registers (no shared memory round-trip)
         float local_rsq = 0.0f;
         unsigned char local_qs = 0;
+        float vals[4] = {fa, fb, fc, fd};
         for (int i = 0; i < dpt; i++) {
-            float val = x[d0 + i];
+            float val = vals[i];
             int idx = (val > -0.086744f) + (val > 0.0f) + (val > 0.086744f);
             float c = TURBO_C2[idx];
             local_rsq += c * c;
